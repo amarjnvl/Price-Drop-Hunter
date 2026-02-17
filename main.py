@@ -1,0 +1,643 @@
+"""
+Price Drop Hunter 🎯 — Telegram + Google Sheets Edition
+
+A single script with three phases:
+  Phase 1: Process new /add commands from Telegram
+  Phase 2: Check live prices for all tracked products
+  Phase 3: Send one consolidated Telegram notification
+
+Environment variables:
+  TELEGRAM_TOKEN     – Bot token from @BotFather
+  CHAT_ID            – Your Telegram chat / group ID
+  GOOGLE_CREDENTIALS – Full JSON content of service account credentials
+  SHEET_ID           – Google Sheet ID (from the URL)
+"""
+
+import json
+import os
+import re
+import sys
+import logging
+import tempfile
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Load .env file (for local testing; ignored in GitHub Actions)
+load_dotenv()
+
+# ──────────────────────────── Logging ────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("price-drop-hunter")
+
+# ──────────────────────────── Config ─────────────────────────────
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CHAT_ID = os.environ.get("CHAT_ID", "")
+GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
+SHEET_ID = os.environ.get("SHEET_ID", "")
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-IN,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Connection": "keep-alive",
+}
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+# ──────────────────────────── Validation ─────────────────────────
+def validate_config() -> None:
+    """Ensure all required env vars are set."""
+    required = {
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "CHAT_ID": CHAT_ID,
+        "GOOGLE_CREDENTIALS": GOOGLE_CREDENTIALS,
+        "SHEET_ID": SHEET_ID,
+    }
+    missing = [name for name, val in required.items() if not val]
+    if missing:
+        log.error("Missing environment variable(s): %s", ", ".join(missing))
+        sys.exit(1)
+
+
+# ──────────────────────────── Google Sheets ──────────────────────
+def connect_to_sheet() -> gspread.Spreadsheet:
+    """Authenticate with Google and return the spreadsheet."""
+    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(SHEET_ID)
+    log.info("📊 Connected to Google Sheet: %s", sheet.title)
+    return sheet
+
+
+def get_products_worksheet(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
+    """Get or create the 'Products' tab."""
+    try:
+        ws = sheet.worksheet("Products")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title="Products", rows=100, cols=4)
+        ws.update("A1:D1", [["Name", "URL", "Target_Price", "Current_Price"]])
+        log.info("Created 'Products' tab with headers.")
+    return ws
+
+
+def get_settings_worksheet(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
+    """Get or create the 'Settings' tab."""
+    try:
+        ws = sheet.worksheet("Settings")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title="Settings", rows=10, cols=1)
+        ws.update_acell("A1", "0")
+        log.info("Created 'Settings' tab with last_update_id = 0.")
+    return ws
+
+
+def get_last_update_id(settings_ws: gspread.Worksheet) -> int:
+    """Read the last processed Telegram update ID from Settings!A1."""
+    val = settings_ws.acell("A1").value
+    return int(val) if val and val.isdigit() else 0
+
+
+def set_last_update_id(settings_ws: gspread.Worksheet, update_id: int) -> None:
+    """Write the last processed update ID to Settings!A1."""
+    settings_ws.update_acell("A1", str(update_id))
+
+
+# ──────────────────────────── Price Helpers ──────────────────────
+def extract_price(text: str) -> float | None:
+    """Pull the first price-like number from a string."""
+    cleaned = text.replace(",", "").strip()
+    match = re.search(r"[\d]+\.?\d*", cleaned)
+    return float(match.group()) if match else None
+
+
+def detect_platform(url: str) -> str:
+    """Return 'amazon' or 'flipkart' based on URL, or 'unknown'."""
+    lower = url.lower()
+    if "amazon" in lower:
+        return "amazon"
+    if "flipkart" in lower:
+        return "flipkart"
+    return "unknown"
+
+
+# ──────────────────────────── Scraping ───────────────────────────
+def fetch_page(url: str) -> BeautifulSoup | None:
+    """Fetch a URL and return a BeautifulSoup object."""
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        return BeautifulSoup(resp.text, "html.parser")
+    except requests.RequestException as exc:
+        log.error("HTTP request failed for %s: %s", url, exc)
+        return None
+
+
+# ── Title Extraction (multi-strategy) ──
+
+def extract_title_from_json_ld(soup: BeautifulSoup) -> str | None:
+    """Extract title from JSON-LD structured data (works on both sites)."""
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            # Handle both single objects and arrays
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                # Match by @type OR by having both 'name' and 'offers' keys
+                is_product = (
+                    item.get("@type") == "Product"
+                    or (item.get("name") and item.get("offers"))
+                )
+                if is_product and item.get("name"):
+                    return item["name"].strip()
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            continue
+    return None
+
+
+def extract_title_from_meta(soup: BeautifulSoup) -> str | None:
+    """Extract title from og:title meta tag."""
+    tag = soup.find("meta", property="og:title")
+    if tag and tag.get("content"):
+        return tag["content"].strip()
+    return None
+
+
+def extract_title_from_page(soup: BeautifulSoup) -> str | None:
+    """Extract and clean the <title> tag."""
+    if soup.title and soup.title.string:
+        raw = soup.title.string.strip()
+        # Clean common suffixes
+        for sep in [" - Buy ", " : Amazon", " | Amazon", " - Amazon",
+                    " Price in India", " at Best Price", " Online at"]:
+            if sep in raw:
+                raw = raw[:raw.index(sep)]
+        return raw.strip() if raw else None
+    return None
+
+
+def scrape_title(soup: BeautifulSoup, platform: str) -> str | None:
+    """Try multiple strategies to get the product title."""
+    # Strategy 1: JSON-LD structured data (most reliable)
+    title = extract_title_from_json_ld(soup)
+    if title:
+        log.info("   📛 Title from JSON-LD: %s", title[:60])
+        return title
+
+    # Strategy 2: Platform-specific CSS selectors
+    if platform == "amazon":
+        tag = soup.select_one("span#productTitle")
+        if tag:
+            title = tag.get_text().strip()
+            if title:
+                log.info("   📛 Title from #productTitle")
+                return title
+
+    if platform == "flipkart":
+        for css in ["span.VU-ZEz", "h1.yhB1nd", "span.B_NuCI", "h1._9E25nV"]:
+            tag = soup.select_one(css)
+            if tag:
+                title = tag.get_text().strip()
+                if title:
+                    log.info("   📛 Title from CSS: %s", css)
+                    return title
+
+    # Strategy 3: og:title meta tag
+    title = extract_title_from_meta(soup)
+    if title:
+        log.info("   📛 Title from og:title")
+        return title
+
+    # Strategy 4: <title> tag (fallback, always present)
+    title = extract_title_from_page(soup)
+    if title:
+        log.info("   📛 Title from <title> tag")
+        return title
+
+    return None
+
+
+# ── Price Extraction (multi-strategy) ──
+
+def extract_price_from_json_ld(soup: BeautifulSoup) -> float | None:
+    """Extract price from JSON-LD structured data."""
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                # Match by @type OR by having 'offers' key
+                is_product = (
+                    item.get("@type") == "Product"
+                    or item.get("offers")
+                )
+                if not is_product:
+                    continue
+                offers = item.get("offers", {})
+                # Could be a single offer or a list
+                if isinstance(offers, list):
+                    offers = offers[0] if offers else {}
+                price = offers.get("price") or offers.get("lowPrice")
+                if price:
+                    return float(str(price).replace(",", ""))
+        except (json.JSONDecodeError, AttributeError, ValueError, TypeError):
+            continue
+    return None
+
+
+def extract_price_from_meta(soup: BeautifulSoup) -> float | None:
+    """Extract price from meta tags (product:price:amount or og:price:amount)."""
+    for prop in ["product:price:amount", "og:price:amount"]:
+        tag = soup.find("meta", property=prop)
+        if tag and tag.get("content"):
+            try:
+                return float(tag["content"].replace(",", ""))
+            except ValueError:
+                continue
+    return None
+
+
+def extract_price_from_html_regex(soup: BeautifulSoup, html_text: str) -> float | None:
+    """
+    Last resort: find ₹X,XXX patterns in the HTML.
+    Returns the LOWEST price found (likely the sale/deal price).
+    """
+    # Match ₹ followed by a price — e.g. ₹1,199 or ₹55,999.00
+    matches = re.findall(r"₹\s*([\d,]+(?:\.\d{1,2})?)", html_text)
+    if not matches:
+        return None
+
+    prices = []
+    for m in matches:
+        try:
+            prices.append(float(m.replace(",", "")))
+        except ValueError:
+            continue
+
+    # Filter out tiny values (like ₹19 protect fees) and huge values
+    valid = [p for p in prices if p >= 50]
+    if valid:
+        # The lowest price is typically the sale price
+        return min(valid)
+    return None
+
+
+def scrape_price(soup: BeautifulSoup, platform: str, html_text: str) -> float | None:
+    """Try multiple strategies to get the product price."""
+    # Strategy 1: JSON-LD structured data (most reliable)
+    price = extract_price_from_json_ld(soup)
+    if price:
+        log.info("   💲 Price from JSON-LD")
+        return price
+
+    # Strategy 2: Platform-specific CSS selectors
+    if platform == "amazon":
+        for css in ["span.a-price-whole", "span#priceblock_dealprice",
+                     "span#priceblock_ourprice", "span.a-offscreen",
+                     "div#corePrice_feature_div span.a-price-whole",
+                     "span.priceToPay span.a-price-whole"]:
+            tag = soup.select_one(css)
+            if tag:
+                p = extract_price(tag.get_text())
+                if p:
+                    log.info("   💲 Price from CSS: %s", css)
+                    return p
+
+    if platform == "flipkart":
+        for css in ["div.Nx9bqj.CxhGGd", "div._30jeq3._16Jk6d",
+                     "div._30jeq3", "div.Nx9bqj"]:
+            tag = soup.select_one(css)
+            if tag:
+                p = extract_price(tag.get_text())
+                if p:
+                    log.info("   💲 Price from CSS: %s", css)
+                    return p
+
+    # Strategy 3: Meta tags
+    price = extract_price_from_meta(soup)
+    if price:
+        log.info("   💲 Price from meta tag")
+        return price
+
+    # Strategy 4: Regex on full HTML (last resort)
+    price = extract_price_from_html_regex(soup, html_text)
+    if price:
+        log.info("   💲 Price from HTML regex (₹ pattern)")
+        return price
+
+    return None
+
+
+# ── Main scraper ──
+
+def scrape_product_info(url: str) -> dict | None:
+    """
+    Scrape a product page and return {'title': ..., 'price': ...}.
+    Uses multiple strategies: JSON-LD → CSS selectors → meta tags → regex.
+    Returns None if the page can't be fetched.
+    """
+    platform = detect_platform(url)
+    if platform == "unknown":
+        log.warning("Unsupported platform: %s", url)
+        return None
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.error("HTTP request failed for %s: %s", url, exc)
+        return None
+
+    html_text = resp.text
+    log.info("   📄 HTTP %d | %d chars | JSON-LD: %s | ₹: %s",
+             resp.status_code, len(html_text),
+             "YES" if "application/ld+json" in html_text else "NO",
+             "YES" if "₹" in html_text else "NO")
+
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    title = scrape_title(soup, platform)
+    price = scrape_price(soup, platform, html_text)
+
+    return {"title": title, "price": price}
+
+
+# ──────────────────────────── Telegram ───────────────────────────
+def get_telegram_updates(last_update_id: int) -> list[dict]:
+    """Fetch new messages from Telegram using getUpdates."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"offset": last_update_id + 1, "timeout": 5}
+
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("ok"):
+            return data.get("result", [])
+    except requests.RequestException as exc:
+        log.error("Failed to fetch Telegram updates: %s", exc)
+    return []
+
+
+def send_telegram_message(message: str) -> bool:
+    """Send a message via the Telegram Bot API."""
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+
+    try:
+        resp = requests.post(api_url, json=payload, timeout=15)
+        resp.raise_for_status()
+        log.info("✅ Telegram message sent successfully.")
+        return True
+    except requests.RequestException as exc:
+        log.error("Failed to send Telegram message: %s", exc)
+        return False
+
+
+def parse_add_command(text: str) -> tuple[str, str] | None:
+    """
+    Parse '/add <URL> <TARGET_PRICE>' from a message.
+    Returns (url, target_price) or None if the format is invalid.
+    """
+    match = re.match(r"/add\s+(https?://\S+)\s+(\d+\.?\d*)", text.strip())
+    if match:
+        return match.group(1), match.group(2)
+    return None
+
+
+def parse_list_command(text: str) -> bool:
+    """Check if the message is a /list command."""
+    return text.strip().lower().startswith("/list")
+
+
+# ══════════════════════════ THREE PHASES ══════════════════════════
+
+
+def phase1_process_commands(
+    settings_ws: gspread.Worksheet,
+    products_ws: gspread.Worksheet,
+) -> list[str]:
+    """
+    Phase 1: Process new /add and /list commands from Telegram.
+    Returns a list of confirmation messages for newly added products.
+    """
+    log.info("═══ Phase 1: Processing Telegram Commands ═══")
+
+    last_update_id = get_last_update_id(settings_ws)
+    updates = get_telegram_updates(last_update_id)
+
+    if not updates:
+        log.info("No new Telegram messages.")
+        return []
+
+    added_messages: list[str] = []
+    new_last_id = last_update_id
+
+    for update in updates:
+        update_id = update.get("update_id", 0)
+        new_last_id = max(new_last_id, update_id)
+
+        message = update.get("message", {})
+        text = message.get("text", "")
+
+        if not text:
+            continue
+
+        # ── Handle /add command ──
+        parsed = parse_add_command(text)
+        if parsed:
+            url, target_price = parsed
+            log.info("📥 /add command: %s at ₹%s", url, target_price)
+
+            # Scrape the product title
+            info = scrape_product_info(url)
+            if info and info.get("title"):
+                name = info["title"]
+                # Truncate long titles
+                if len(name) > 60:
+                    name = name[:57] + "..."
+            else:
+                # Fallback: use domain + last part of URL
+                name = f"Product ({detect_platform(url).capitalize()})"
+
+            current_price = info["price"] if info else None
+            price_str = f"₹{current_price:,.2f}" if current_price else "N/A"
+
+            # Append to Google Sheet
+            products_ws.append_row(
+                [name, url, str(target_price), str(current_price or "N/A")]
+            )
+            log.info("   ✅ Added '%s' to sheet.", name)
+
+            added_messages.append(
+                f"✅ <b>{name}</b>\n"
+                f"   Target: ₹{float(target_price):,.0f} | Current: {price_str}"
+            )
+            continue
+
+        # ── Handle /list command ──
+        if parse_list_command(text):
+            log.info("📋 /list command received.")
+            all_rows = products_ws.get_all_values()
+            if len(all_rows) <= 1:
+                send_telegram_message("📋 Your watchlist is empty.\nUse /add <URL> <TARGET_PRICE> to add products.")
+            else:
+                lines = ["📋 <b>Your Watchlist</b>\n"]
+                for i, row in enumerate(all_rows[1:], 1):
+                    name = row[0] if len(row) > 0 else "?"
+                    target = row[2] if len(row) > 2 else "?"
+                    current = row[3] if len(row) > 3 else "N/A"
+                    lines.append(f"{i}. <b>{name}</b>\n   Target: ₹{target} | Last: {current}")
+                send_telegram_message("\n".join(lines))
+            continue
+
+    # Update the last processed ID
+    if new_last_id > last_update_id:
+        set_last_update_id(settings_ws, new_last_id)
+        log.info("Updated last_update_id → %d", new_last_id)
+
+    return added_messages
+
+
+def phase2_check_prices(
+    products_ws: gspread.Worksheet,
+) -> list[dict]:
+    """
+    Phase 2: Read all products from the sheet, scrape live prices,
+    update the Current_Price column, and return deals.
+    """
+    log.info("═══ Phase 2: Checking Live Prices ═══")
+
+    all_rows = products_ws.get_all_values()
+    if len(all_rows) <= 1:
+        log.info("No products in the sheet.")
+        return []
+
+    alerts: list[dict] = []
+
+    for i, row in enumerate(all_rows[1:], 2):  # row 2 onwards (1-indexed in Sheets)
+        if len(row) < 3:
+            continue
+
+        name = row[0]
+        url = row[1]
+        target = float(row[2])
+
+        log.info("🔍 [%d/%d] %s", i - 1, len(all_rows) - 1, name)
+
+        try:
+            info = scrape_product_info(url)
+        except Exception as exc:
+            log.error("   ❌ Error scraping '%s': %s", name, exc)
+            continue
+
+        if not info or info.get("price") is None:
+            log.warning("   ⚠️  Could not get price for '%s'.", name)
+            continue
+
+        live_price = info["price"]
+        log.info("   💰 ₹%.2f (target ₹%.0f)", live_price, target)
+
+        # Update Current_Price in the sheet (column D)
+        try:
+            products_ws.update_cell(i, 4, f"{live_price:.2f}")
+        except Exception as exc:
+            log.warning("   Could not update sheet cell: %s", exc)
+
+        if live_price <= target:
+            alerts.append({
+                "name": name,
+                "url": url,
+                "live_price": live_price,
+                "target_price": target,
+                "saved": target - live_price,
+            })
+            log.info("   🔥 DEAL! ₹%.0f below target.", target - live_price)
+        else:
+            log.info("   ⏳ Above target by ₹%.0f.", live_price - target)
+
+    return alerts
+
+
+def phase3_notify(
+    added_messages: list[str],
+    alerts: list[dict],
+) -> None:
+    """
+    Phase 3: Send one consolidated Telegram message
+    covering new additions and price-drop alerts.
+    """
+    log.info("═══ Phase 3: Sending Notifications ═══")
+
+    lines: list[str] = []
+
+    # ── Newly added products ──
+    if added_messages:
+        lines.append("📥 <b>Newly Added to Watchlist</b>\n")
+        lines.extend(added_messages)
+        lines.append("")
+
+    # ── Price drop alerts ──
+    if alerts:
+        lines.append("🔥 <b>Price Drop Alerts!</b>\n")
+        for i, deal in enumerate(alerts, 1):
+            lines.append(
+                f"{i}. <b>{deal['name']}</b>\n"
+                f"   💰 ₹{deal['live_price']:,.2f}  (target ₹{deal['target_price']:,.0f})\n"
+                f"   📉 You save ₹{deal['saved']:,.2f}\n"
+                f"   🔗 <a href=\"{deal['url']}\">Buy Now →</a>\n"
+            )
+
+    if not lines:
+        log.info("Nothing to report. No Telegram message sent.")
+        return
+
+    lines.append("— <i>Price Drop Hunter 🎯</i>")
+    send_telegram_message("\n".join(lines))
+
+
+# ──────────────────────────── Main ───────────────────────────────
+def main() -> None:
+    validate_config()
+
+    # Connect to Google Sheets
+    sheet = connect_to_sheet()
+    products_ws = get_products_worksheet(sheet)
+    settings_ws = get_settings_worksheet(sheet)
+
+    # Phase 1 — Process new Telegram commands
+    added_messages = phase1_process_commands(settings_ws, products_ws)
+
+    # Phase 2 — Check all tracked prices
+    alerts = phase2_check_prices(products_ws)
+
+    # Phase 3 — Send consolidated notification
+    phase3_notify(added_messages, alerts)
+
+    log.info("🏁 Done.")
+
+
+if __name__ == "__main__":
+    main()
