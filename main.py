@@ -1477,8 +1477,10 @@ def process_single_message(
 app = Flask(__name__)
 
 # Register bot commands at import time (for gunicorn on Render)
+# Run in background thread to avoid blocking worker startup
+import threading
 if TELEGRAM_TOKEN:
-    register_bot_commands()
+    threading.Thread(target=register_bot_commands, daemon=True).start()
 
 
 @app.route("/health", methods=["GET"])
