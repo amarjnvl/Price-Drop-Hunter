@@ -19,6 +19,7 @@ import re
 import sys
 import logging
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -45,6 +46,15 @@ CHAT_ID = os.environ.get("CHAT_ID", "")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 SHEET_ID = os.environ.get("SHEET_ID", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+# Indian Standard Time (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def now_ist() -> datetime:
+    """Return the current time in IST."""
+    return datetime.now(IST)
+
 
 HEADERS = {
     "User-Agent": (
@@ -110,6 +120,31 @@ def get_settings_worksheet(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
         ws.update_acell("A1", "0")
         log.info("Created 'Settings' tab with last_update_id = 0.")
     return ws
+
+
+def get_history_worksheet(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
+    """Get or create the 'Price_History' tab."""
+    try:
+        ws = sheet.worksheet("Price_History")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title="Price_History", rows=1000, cols=4)
+        ws.update("A1:D1", [["Date", "Product", "Price", "Target"]])
+        log.info("Created 'Price_History' tab with headers.")
+    return ws
+
+
+def log_price_history(
+    history_ws: gspread.Worksheet,
+    name: str,
+    price: float,
+    target: float,
+) -> None:
+    """Append a row to the Price_History tab."""
+    now = now_ist().strftime("%Y-%m-%d %H:%M")
+    try:
+        history_ws.append_row([now, name, f"{price:.2f}", f"{target:.0f}"])
+    except Exception as exc:
+        log.warning("Could not log to Price_History: %s", exc)
 
 
 def get_last_update_id(settings_ws: gspread.Worksheet) -> int:
@@ -428,9 +463,9 @@ def register_bot_commands() -> None:
     api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
     commands = [
         {"command": "list", "description": "📋 View your watchlist"},
-        {"command": "remove", "description": "🗑️ Remove a product (e.g. /remove 2)"},
-        {"command": "edit", "description": "✏️ Change target price (e.g. /edit 2 1500)"},
-        {"command": "status", "description": "📊 Quick summary of your watchlist"},
+        {"command": "remove", "description": "🗑️ Remove a product"},
+        {"command": "edit", "description": "✏️ Change target price"},
+        {"command": "status", "description": "📊 Quick summary"},
         {"command": "help", "description": "❓ Show all commands"},
     ]
     try:
@@ -526,6 +561,7 @@ def handle_add_product(
     else:
         name = f"Product ({detect_platform(url).capitalize()})"
 
+    platform = detect_platform(url).capitalize()
     current_price = info["price"] if info else None
 
     # Auto-calculate target if not provided
@@ -546,9 +582,23 @@ def handle_add_product(
     )
     log.info("   ✅ Added '%s' to sheet.", name)
 
+    # Build rich confirmation
+    gap = ""
+    if current_price and target_price:
+        diff = current_price - target_price
+        if diff > 0:
+            gap = f"\n   📏 Gap to target: ₹{diff:,.0f} ({diff/current_price*100:.0f}% away)"
+        else:
+            gap = f"\n   🔥 Already below target by ₹{abs(diff):,.0f}!"
+
+    now_str = now_ist().strftime("%H:%M IST, %d %b %Y")
     return (
         f"✅ <b>{name}</b>\n"
-        f"   Target: ₹{target_price:,.0f}{auto_label} | Current: {price_str}"
+        f"   🏪 {platform}\n"
+        f"   💰 Current: {price_str}\n"
+        f"   🎯 Target: ₹{target_price:,.0f}{auto_label}"
+        f"{gap}\n"
+        f"   🕐 Tracking started: {now_str}"
     )
 
 
@@ -661,6 +711,20 @@ def phase1_process_commands(
             continue
 
         # ── /remove — Remove product(s) ──
+        if text_lower.strip() == "/remove" or text_lower.strip().startswith("/remove@"):
+            # Bare command — show watchlist + usage
+            all_rows = products_ws.get_all_values()
+            if len(all_rows) <= 1:
+                send_telegram_message("📋 Watchlist is empty — nothing to remove.", chat_id)
+            else:
+                lines = ["🗑️ <b>Which product to remove?</b>\n"]
+                for i, row in enumerate(all_rows[1:], 1):
+                    name = row[0] if len(row) > 0 else "?"
+                    lines.append(f"{i}. {name}")
+                lines.append("\nReply with:\n• <code>/remove 2</code> — remove #2\n• <code>/remove all</code> — clear all")
+                send_telegram_message("\n".join(lines), chat_id)
+            continue
+
         remove_arg = parse_remove_command(text)
         if remove_arg is not None:
             all_rows = products_ws.get_all_values()
@@ -706,6 +770,21 @@ def phase1_process_commands(
             continue
 
         # ── /edit — Change target price ──
+        if text_lower.strip() == "/edit" or text_lower.strip().startswith("/edit@"):
+            # Bare command — show watchlist + usage
+            all_rows = products_ws.get_all_values()
+            if len(all_rows) <= 1:
+                send_telegram_message("📋 Watchlist is empty — nothing to edit.", chat_id)
+            else:
+                lines = ["✏️ <b>Which product to edit?</b>\n"]
+                for i, row in enumerate(all_rows[1:], 1):
+                    name = row[0] if len(row) > 0 else "?"
+                    target = row[2] if len(row) > 2 else "?"
+                    lines.append(f"{i}. {name} (target: ₹{target})")
+                lines.append("\nReply with:\n• <code>/edit 2 1500</code> — set #2 target to ₹1,500")
+                send_telegram_message("\n".join(lines), chat_id)
+            continue
+
         edit_parsed = parse_edit_command(text)
         if edit_parsed:
             idx, new_price = edit_parsed
@@ -748,19 +827,23 @@ def phase1_process_commands(
 
 def phase2_check_prices(
     products_ws: gspread.Worksheet,
-) -> list[dict]:
+    history_ws: gspread.Worksheet | None = None,
+) -> tuple[list[dict], list[dict]]:
     """
     Phase 2: Read all products from the sheet, scrape live prices,
-    update the Current_Price column, and return deals.
+    update the Current_Price column, log history, and return
+    (alerts, changes).
     """
     log.info("═══ Phase 2: Checking Live Prices ═══")
 
     all_rows = products_ws.get_all_values()
     if len(all_rows) <= 1:
         log.info("No products in the sheet.")
-        return []
+        return [], []
 
     alerts: list[dict] = []
+    changes: list[dict] = []  # All price movements
+    checked = 0
 
     for i, row in enumerate(all_rows[1:], 2):  # row 2 onwards (1-indexed in Sheets)
         if len(row) < 3:
@@ -769,6 +852,13 @@ def phase2_check_prices(
         name = row[0]
         url = row[1]
         target = float(row[2])
+        old_price_str = row[3] if len(row) > 3 else "N/A"
+
+        # Parse old price for comparison
+        try:
+            old_price = float(old_price_str) if old_price_str != "N/A" else None
+        except ValueError:
+            old_price = None
 
         log.info("🔍 [%d/%d] %s", i - 1, len(all_rows) - 1, name)
 
@@ -783,6 +873,7 @@ def phase2_check_prices(
             continue
 
         live_price = info["price"]
+        checked += 1
         log.info("   💰 ₹%.2f (target ₹%.0f)", live_price, target)
 
         # Update Current_Price in the sheet (column D)
@@ -790,6 +881,21 @@ def phase2_check_prices(
             products_ws.update_cell(i, 4, f"{live_price:.2f}")
         except Exception as exc:
             log.warning("   Could not update sheet cell: %s", exc)
+
+        # Log to Price_History
+        if history_ws:
+            log_price_history(history_ws, name, live_price, target)
+
+        # Track price change
+        if old_price is not None and old_price != live_price:
+            diff = live_price - old_price
+            changes.append({
+                "name": name,
+                "old_price": old_price,
+                "new_price": live_price,
+                "diff": diff,
+                "target": target,
+            })
 
         if live_price <= target:
             alerts.append({
@@ -803,16 +909,20 @@ def phase2_check_prices(
         else:
             log.info("   ⏳ Above target by ₹%.0f.", live_price - target)
 
-    return alerts
+    log.info("   📊 Checked %d products, %d changes, %d deals.",
+             checked, len(changes), len(alerts))
+    return alerts, changes
 
 
 def phase3_notify(
     added_messages: list[str],
     alerts: list[dict],
+    changes: list[dict] | None = None,
+    total_checked: int = 0,
 ) -> None:
     """
     Phase 3: Send one consolidated Telegram message
-    covering new additions and price-drop alerts.
+    covering new additions, price-drop alerts, and price movements.
     """
     log.info("═══ Phase 3: Sending Notifications ═══")
 
@@ -835,11 +945,37 @@ def phase3_notify(
                 f"   🔗 <a href=\"{deal['url']}\">Buy Now →</a>\n"
             )
 
+    # ── Price movements (even if not deals) ──
+    if changes:
+        lines.append("📊 <b>Price Movements</b>\n")
+        for ch in changes:
+            diff = ch["diff"]
+            if diff < 0:
+                arrow = "📉"
+                label = f"Dropped ₹{abs(diff):,.0f}"
+            else:
+                arrow = "📈"
+                label = f"Rose ₹{diff:,.0f}"
+            lines.append(
+                f"{arrow} <b>{ch['name']}</b>\n"
+                f"   ₹{ch['old_price']:,.0f} → ₹{ch['new_price']:,.0f} ({label})"
+            )
+        lines.append("")
+
+    # ── Summary footer ──
+    if total_checked > 0:
+        unchanged = total_checked - len(changes or []) - len(alerts)
+        if unchanged > 0 and not changes and not alerts:
+            lines.append(f"✅ All {total_checked} products checked — no changes.")
+        elif unchanged > 0:
+            lines.append(f"✅ {unchanged} other product(s) unchanged.")
+
     if not lines:
         log.info("Nothing to report. No Telegram message sent.")
         return
 
-    lines.append("— <i>Price Drop Hunter 🎯</i>")
+    now_str = now_ist().strftime("%H:%M IST")
+    lines.append(f"\n— <i>Price Drop Hunter 🎯 ({now_str})</i>")
     send_telegram_message("\n".join(lines))
 
 
@@ -932,6 +1068,19 @@ def process_single_message(
         return
 
     # ── /remove — Remove product(s) ──
+    if text_lower.strip() == "/remove" or text_lower.strip().startswith("/remove@"):
+        all_rows = products_ws.get_all_values()
+        if len(all_rows) <= 1:
+            send_telegram_message("📋 Watchlist is empty — nothing to remove.", chat_id)
+        else:
+            lines = ["🗑️ <b>Which product to remove?</b>\n"]
+            for i, row in enumerate(all_rows[1:], 1):
+                name = row[0] if len(row) > 0 else "?"
+                lines.append(f"{i}. {name}")
+            lines.append("\nReply with:\n• <code>/remove 2</code> — remove #2\n• <code>/remove all</code> — clear all")
+            send_telegram_message("\n".join(lines), chat_id)
+        return
+
     remove_arg = parse_remove_command(text)
     if remove_arg is not None:
         all_rows = products_ws.get_all_values()
@@ -976,6 +1125,20 @@ def process_single_message(
         return
 
     # ── /edit — Change target price ──
+    if text_lower.strip() == "/edit" or text_lower.strip().startswith("/edit@"):
+        all_rows = products_ws.get_all_values()
+        if len(all_rows) <= 1:
+            send_telegram_message("📋 Watchlist is empty — nothing to edit.", chat_id)
+        else:
+            lines = ["✏️ <b>Which product to edit?</b>\n"]
+            for i, row in enumerate(all_rows[1:], 1):
+                name = row[0] if len(row) > 0 else "?"
+                target = row[2] if len(row) > 2 else "?"
+                lines.append(f"{i}. {name} (target: ₹{target})")
+            lines.append("\nReply with:\n• <code>/edit 2 1500</code> — set #2 target to ₹1,500")
+            send_telegram_message("\n".join(lines), chat_id)
+        return
+
     edit_parsed = parse_edit_command(text)
     if edit_parsed:
         idx, new_price = edit_parsed
@@ -1011,6 +1174,10 @@ def process_single_message(
 # ──────────────────────────── Flask App ───────────────────────────
 
 app = Flask(__name__)
+
+# Register bot commands at import time (for gunicorn on Render)
+if TELEGRAM_TOKEN:
+    register_bot_commands()
 
 
 @app.route("/health", methods=["GET"])
@@ -1070,14 +1237,17 @@ def check_prices_endpoint():
         validate_config()
         sheet = connect_to_sheet()
         products_ws = get_products_worksheet(sheet)
+        history_ws = get_history_worksheet(sheet)
 
-        alerts = phase2_check_prices(products_ws)
-        phase3_notify([], alerts)
+        total = max(0, len(products_ws.get_all_values()) - 1)
+        alerts, changes = phase2_check_prices(products_ws, history_ws)
+        phase3_notify([], alerts, changes, total)
 
         return jsonify({
             "ok": True,
-            "products_checked": len(products_ws.get_all_values()) - 1,
+            "products_checked": total,
             "alerts": len(alerts),
+            "changes": len(changes),
         })
     except Exception as exc:
         log.error("Price check error: %s", exc)
@@ -1096,15 +1266,17 @@ def main() -> None:
     sheet = connect_to_sheet()
     products_ws = get_products_worksheet(sheet)
     settings_ws = get_settings_worksheet(sheet)
+    history_ws = get_history_worksheet(sheet)
 
     # Phase 1 — Process new Telegram commands
     added_messages = phase1_process_commands(settings_ws, products_ws)
 
     # Phase 2 — Check all tracked prices
-    alerts = phase2_check_prices(products_ws)
+    total = max(0, len(products_ws.get_all_values()) - 1)
+    alerts, changes = phase2_check_prices(products_ws, history_ws)
 
     # Phase 3 — Send consolidated notification
-    phase3_notify(added_messages, alerts)
+    phase3_notify(added_messages, alerts, changes, total)
 
     log.info("🏁 Done.")
 
