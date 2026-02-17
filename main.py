@@ -101,13 +101,22 @@ def connect_to_sheet() -> gspread.Spreadsheet:
 
 
 def get_products_worksheet(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
-    """Get or create the 'Products' tab."""
+    """Get or create the 'Products' tab with 6 columns."""
     try:
         ws = sheet.worksheet("Products")
     except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title="Products", rows=100, cols=4)
-        ws.update("A1:D1", [["Name", "URL", "Target_Price", "Current_Price"]])
+        ws = sheet.add_worksheet(title="Products", rows=100, cols=6)
+        ws.update("A1:F1", [["Name", "URL", "Target_Price", "Current_Price",
+                              "Last_Alerted", "Status"]])
         log.info("Created 'Products' tab with headers.")
+        return ws
+
+    # Auto-migrate: add missing columns E, F if sheet was created before
+    headers = ws.row_values(1)
+    if len(headers) < 5:
+        ws.update_acell("E1", "Last_Alerted")
+    if len(headers) < 6:
+        ws.update_acell("F1", "Status")
     return ws
 
 
@@ -465,6 +474,9 @@ def register_bot_commands() -> None:
         {"command": "list", "description": "📋 View your watchlist"},
         {"command": "remove", "description": "🗑️ Remove a product"},
         {"command": "edit", "description": "✏️ Change target price"},
+        {"command": "history", "description": "📜 Price history for a product"},
+        {"command": "pause", "description": "⏸️ Pause tracking"},
+        {"command": "resume", "description": "▶️ Resume tracking"},
         {"command": "status", "description": "📊 Quick summary"},
         {"command": "help", "description": "❓ Show all commands"},
     ]
@@ -526,6 +538,24 @@ def parse_edit_command(text: str) -> tuple[int, float] | None:
     if match:
         return int(match.group(1)), float(match.group(2))
     return None
+
+
+def parse_history_command(text: str) -> int | None:
+    """Parse '/history <n>'. Returns the index or None."""
+    match = re.match(r"/history\s+(\d+)", text.strip(), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def parse_pause_command(text: str) -> int | None:
+    """Parse '/pause <n>'. Returns the index or None."""
+    match = re.match(r"/pause\s+(\d+)", text.strip(), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def parse_resume_command(text: str) -> int | None:
+    """Parse '/resume <n>'. Returns the index or None."""
+    match = re.match(r"/resume\s+(\d+)", text.strip(), re.IGNORECASE)
+    return int(match.group(1)) if match else None
 
 
 def is_duplicate_url(products_ws: gspread.Worksheet, url: str) -> bool:
@@ -608,6 +638,7 @@ def handle_add_product(
 def phase1_process_commands(
     settings_ws: gspread.Worksheet,
     products_ws: gspread.Worksheet,
+    history_ws: gspread.Worksheet | None = None,
 ) -> list[str]:
     """
     Phase 1: Process Telegram commands and auto-detected URLs.
@@ -665,8 +696,11 @@ def phase1_process_commands(
                 "• /list — View all tracked products\n"
                 "• /remove 2 — Remove product #2\n"
                 "• /remove all — Clear entire watchlist\n"
-                "• /edit 2 1500 — Change target for #2 to ₹1,500\n\n"
+                "• /edit 2 1500 — Change target for #2\n"
+                "• /pause 2 — Pause tracking for #2\n"
+                "• /resume 2 — Resume tracking for #2\n\n"
                 "<b>Info:</b>\n"
+                "• /history 1 — Price history for #1\n"
                 "• /status — Quick summary\n"
                 "• /help — This message\n\n"
                 "Prices are checked every hour automatically. 🕐",
@@ -678,9 +712,12 @@ def phase1_process_commands(
         if text_lower.startswith("/status"):
             all_rows = products_ws.get_all_values()
             count = max(0, len(all_rows) - 1)
+            paused = sum(1 for r in all_rows[1:] if len(r) > 5 and r[5] == "paused")
+            active = count - paused
             send_telegram_message(
                 f"📊 <b>Status</b>\n\n"
-                f"Products tracked: <b>{count}</b>\n"
+                f"Products tracked: <b>{count}</b> "
+                f"(🟢 {active} active, ⏸️ {paused} paused)\n"
                 f"Price checks: every 1 hour\n"
                 f"Scraping: Amazon + Flipkart",
                 chat_id,
@@ -703,8 +740,10 @@ def phase1_process_commands(
                     name = row[0] if len(row) > 0 else "?"
                     target = row[2] if len(row) > 2 else "?"
                     current = row[3] if len(row) > 3 else "N/A"
+                    status = row[5] if len(row) > 5 else "active"
+                    icon = "⏸️" if status == "paused" else "🟢"
                     lines.append(
-                        f"{i}. <b>{name}</b>\n"
+                        f"{icon} {i}. <b>{name}</b>\n"
                         f"   Target: ₹{target} | Last: {current}"
                     )
                 send_telegram_message("\n".join(lines), chat_id)
@@ -807,6 +846,120 @@ def phase1_process_commands(
                 log.info("   ✏️ Updated target for '%s' → ₹%.0f", name, new_price)
             continue
 
+        # ── /history — Show price history ──
+        if text_lower.strip() == "/history" or text_lower.strip().startswith("/history@"):
+            all_rows = products_ws.get_all_values()
+            if len(all_rows) <= 1:
+                send_telegram_message("📋 Watchlist is empty — nothing to show.", chat_id)
+            else:
+                lines = ["📜 <b>Which product's history?</b>\n"]
+                for i, row in enumerate(all_rows[1:], 1):
+                    name = row[0] if len(row) > 0 else "?"
+                    lines.append(f"{i}. {name}")
+                lines.append("\nReply with:\n• <code>/history 1</code> — show history for #1")
+                send_telegram_message("\n".join(lines), chat_id)
+            continue
+
+        history_idx = parse_history_command(text)
+        if history_idx is not None:
+            all_rows = products_ws.get_all_values()
+            data_count = len(all_rows) - 1
+            if history_idx < 1 or history_idx > data_count:
+                send_telegram_message(
+                    f"⚠️ Invalid number. You have {data_count} product(s). "
+                    f"Use /list to see them.", chat_id,
+                )
+            elif history_ws:
+                product_name = all_rows[history_idx][0]
+                hist_rows = history_ws.get_all_values()
+                matches = [r for r in hist_rows[1:] if r[1] == product_name]
+                if not matches:
+                    send_telegram_message(
+                        f"📜 No history yet for <b>{product_name}</b>.\n"
+                        "History is recorded during hourly price checks.",
+                        chat_id,
+                    )
+                else:
+                    recent = matches[-10:]  # Last 10 entries
+                    lines = [f"📜 <b>Price History: {product_name}</b>\n"]
+                    for entry in reversed(recent):
+                        date = entry[0] if len(entry) > 0 else "?"
+                        price = entry[2] if len(entry) > 2 else "?"
+                        lines.append(f"  {date} — ₹{price}")
+                    send_telegram_message("\n".join(lines), chat_id)
+            else:
+                send_telegram_message("⚠️ Price history is not available.", chat_id)
+            continue
+
+        # ── /pause — Pause tracking ──
+        if text_lower.strip() == "/pause" or text_lower.strip().startswith("/pause@"):
+            all_rows = products_ws.get_all_values()
+            if len(all_rows) <= 1:
+                send_telegram_message("📋 Watchlist is empty.", chat_id)
+            else:
+                lines = ["⏸️ <b>Which product to pause?</b>\n"]
+                for i, row in enumerate(all_rows[1:], 1):
+                    name = row[0] if len(row) > 0 else "?"
+                    status = row[5] if len(row) > 5 else "active"
+                    icon = "⏸️" if status == "paused" else "🟢"
+                    lines.append(f"{icon} {i}. {name}")
+                lines.append("\nReply with:\n• <code>/pause 1</code> — pause #1")
+                send_telegram_message("\n".join(lines), chat_id)
+            continue
+
+        pause_idx = parse_pause_command(text)
+        if pause_idx is not None:
+            all_rows = products_ws.get_all_values()
+            data_count = len(all_rows) - 1
+            if pause_idx < 1 or pause_idx > data_count:
+                send_telegram_message(
+                    f"⚠️ Invalid number. You have {data_count} product(s).", chat_id,
+                )
+            else:
+                name = all_rows[pause_idx][0] if len(all_rows[pause_idx]) > 0 else "?"
+                products_ws.update_cell(pause_idx + 1, 6, "paused")
+                send_telegram_message(
+                    f"⏸️ Paused tracking for <b>{name}</b>.\n"
+                    f"Use <code>/resume {pause_idx}</code> to resume.",
+                    chat_id,
+                )
+                log.info("   ⏸️ Paused '%s'.", name)
+            continue
+
+        # ── /resume — Resume tracking ──
+        if text_lower.strip() == "/resume" or text_lower.strip().startswith("/resume@"):
+            all_rows = products_ws.get_all_values()
+            if len(all_rows) <= 1:
+                send_telegram_message("📋 Watchlist is empty.", chat_id)
+            else:
+                lines = ["▶️ <b>Which product to resume?</b>\n"]
+                for i, row in enumerate(all_rows[1:], 1):
+                    name = row[0] if len(row) > 0 else "?"
+                    status = row[5] if len(row) > 5 else "active"
+                    icon = "⏸️" if status == "paused" else "🟢"
+                    lines.append(f"{icon} {i}. {name}")
+                lines.append("\nReply with:\n• <code>/resume 1</code> — resume #1")
+                send_telegram_message("\n".join(lines), chat_id)
+            continue
+
+        resume_idx = parse_resume_command(text)
+        if resume_idx is not None:
+            all_rows = products_ws.get_all_values()
+            data_count = len(all_rows) - 1
+            if resume_idx < 1 or resume_idx > data_count:
+                send_telegram_message(
+                    f"⚠️ Invalid number. You have {data_count} product(s).", chat_id,
+                )
+            else:
+                name = all_rows[resume_idx][0] if len(all_rows[resume_idx]) > 0 else "?"
+                products_ws.update_cell(resume_idx + 1, 6, "active")
+                send_telegram_message(
+                    f"▶️ Resumed tracking for <b>{name}</b>.",
+                    chat_id,
+                )
+                log.info("   ▶️ Resumed '%s'.", name)
+            continue
+
         # ── Auto-detect URL (no /add needed) ──
         url_detected = detect_url_in_text(text)
         if url_detected:
@@ -853,6 +1006,13 @@ def phase2_check_prices(
         url = row[1]
         target = float(row[2])
         old_price_str = row[3] if len(row) > 3 else "N/A"
+        last_alerted_str = row[4] if len(row) > 4 else ""
+        status = row[5] if len(row) > 5 else "active"
+
+        # Skip paused products
+        if status == "paused":
+            log.info("⏸️  [%d/%d] %s — paused, skipping.", i - 1, len(all_rows) - 1, name)
+            continue
 
         # Parse old price for comparison
         try:
@@ -898,15 +1058,26 @@ def phase2_check_prices(
             })
 
         if live_price <= target:
-            alerts.append({
-                "name": name,
-                "url": url,
-                "live_price": live_price,
-                "target_price": target,
-                "saved": target - live_price,
-            })
-            log.info("   🔥 DEAL! ₹%.0f below target.", target - live_price)
+            # Smart alert: skip if we already notified at this price
+            if last_alerted_str == f"{live_price:.2f}":
+                log.info("   🔕 Already alerted at ₹%.2f, skipping.", live_price)
+            else:
+                alerts.append({
+                    "name": name,
+                    "url": url,
+                    "live_price": live_price,
+                    "target_price": target,
+                    "saved": target - live_price,
+                    "row_index": i,  # For writing Last_Alerted
+                })
+                log.info("   🔥 DEAL! ₹%.0f below target.", target - live_price)
         else:
+            # Price above target: clear Last_Alerted so future drops re-trigger
+            if last_alerted_str:
+                try:
+                    products_ws.update_cell(i, 5, "")
+                except Exception:
+                    pass
             log.info("   ⏳ Above target by ₹%.0f.", live_price - target)
 
     log.info("   📊 Checked %d products, %d changes, %d deals.",
@@ -919,6 +1090,7 @@ def phase3_notify(
     alerts: list[dict],
     changes: list[dict] | None = None,
     total_checked: int = 0,
+    products_ws: gspread.Worksheet | None = None,
 ) -> None:
     """
     Phase 3: Send one consolidated Telegram message
@@ -944,6 +1116,14 @@ def phase3_notify(
                 f"   📉 You save ₹{deal['saved']:,.2f}\n"
                 f"   🔗 <a href=\"{deal['url']}\">Buy Now →</a>\n"
             )
+            # Write Last_Alerted so we don't re-alert at the same price
+            if products_ws and "row_index" in deal:
+                try:
+                    products_ws.update_cell(
+                        deal["row_index"], 5, f"{deal['live_price']:.2f}"
+                    )
+                except Exception:
+                    pass
 
     # ── Price movements (even if not deals) ──
     if changes:
@@ -985,6 +1165,7 @@ def process_single_message(
     text: str,
     chat_id: str,
     products_ws: gspread.Worksheet,
+    history_ws: gspread.Worksheet | None = None,
 ) -> None:
     """
     Process a single incoming Telegram message instantly.
@@ -1022,8 +1203,11 @@ def process_single_message(
             "• /list — View all tracked products\n"
             "• /remove 2 — Remove product #2\n"
             "• /remove all — Clear entire watchlist\n"
-            "• /edit 2 1500 — Change target for #2 to ₹1,500\n\n"
+            "• /edit 2 1500 — Change target for #2\n"
+            "• /pause 2 — Pause tracking for #2\n"
+            "• /resume 2 — Resume tracking for #2\n\n"
             "<b>Info:</b>\n"
+            "• /history 1 — Price history for #1\n"
             "• /status — Quick summary\n"
             "• /help — This message\n\n"
             "Prices are checked every hour automatically. 🕐",
@@ -1035,9 +1219,12 @@ def process_single_message(
     if text_lower.startswith("/status"):
         all_rows = products_ws.get_all_values()
         count = max(0, len(all_rows) - 1)
+        paused = sum(1 for r in all_rows[1:] if len(r) > 5 and r[5] == "paused")
+        active = count - paused
         send_telegram_message(
             f"📊 <b>Status</b>\n\n"
-            f"Products tracked: <b>{count}</b>\n"
+            f"Products tracked: <b>{count}</b> "
+            f"(🟢 {active} active, ⏸️ {paused} paused)\n"
             f"Price checks: every 1 hour\n"
             f"Scraping: Amazon + Flipkart",
             chat_id,
@@ -1060,8 +1247,10 @@ def process_single_message(
                 name = row[0] if len(row) > 0 else "?"
                 target = row[2] if len(row) > 2 else "?"
                 current = row[3] if len(row) > 3 else "N/A"
+                status = row[5] if len(row) > 5 else "active"
+                icon = "⏸️" if status == "paused" else "🟢"
                 lines.append(
-                    f"{i}. <b>{name}</b>\n"
+                    f"{icon} {i}. <b>{name}</b>\n"
                     f"   Target: ₹{target} | Last: {current}"
                 )
             send_telegram_message("\n".join(lines), chat_id)
@@ -1161,6 +1350,118 @@ def process_single_message(
             log.info("   ✏️ Updated target for '%s' → ₹%.0f", name, new_price)
         return
 
+    # ── /history — Show price history ──
+    if text_lower.strip() == "/history" or text_lower.strip().startswith("/history@"):
+        all_rows = products_ws.get_all_values()
+        if len(all_rows) <= 1:
+            send_telegram_message("📋 Watchlist is empty — nothing to show.", chat_id)
+        else:
+            lines = ["📜 <b>Which product's history?</b>\n"]
+            for i, row in enumerate(all_rows[1:], 1):
+                name = row[0] if len(row) > 0 else "?"
+                lines.append(f"{i}. {name}")
+            lines.append("\nReply with:\n• <code>/history 1</code> — show history for #1")
+            send_telegram_message("\n".join(lines), chat_id)
+        return
+
+    history_idx = parse_history_command(text)
+    if history_idx is not None:
+        all_rows = products_ws.get_all_values()
+        data_count = len(all_rows) - 1
+        if history_idx < 1 or history_idx > data_count:
+            send_telegram_message(
+                f"⚠️ Invalid number. You have {data_count} product(s). "
+                f"Use /list to see them.", chat_id,
+            )
+        elif history_ws:
+            product_name = all_rows[history_idx][0]
+            hist_rows = history_ws.get_all_values()
+            matches = [r for r in hist_rows[1:] if r[1] == product_name]
+            if not matches:
+                send_telegram_message(
+                    f"📜 No history yet for <b>{product_name}</b>.\n"
+                    "History is recorded during hourly price checks.",
+                    chat_id,
+                )
+            else:
+                recent = matches[-10:]
+                lines = [f"📜 <b>Price History: {product_name}</b>\n"]
+                for entry in reversed(recent):
+                    date = entry[0] if len(entry) > 0 else "?"
+                    price = entry[2] if len(entry) > 2 else "?"
+                    lines.append(f"  {date} — ₹{price}")
+                send_telegram_message("\n".join(lines), chat_id)
+        else:
+            send_telegram_message("⚠️ Price history is not available.", chat_id)
+        return
+
+    # ── /pause — Pause tracking ──
+    if text_lower.strip() == "/pause" or text_lower.strip().startswith("/pause@"):
+        all_rows = products_ws.get_all_values()
+        if len(all_rows) <= 1:
+            send_telegram_message("📋 Watchlist is empty.", chat_id)
+        else:
+            lines = ["⏸️ <b>Which product to pause?</b>\n"]
+            for i, row in enumerate(all_rows[1:], 1):
+                name = row[0] if len(row) > 0 else "?"
+                status = row[5] if len(row) > 5 else "active"
+                icon = "⏸️" if status == "paused" else "🟢"
+                lines.append(f"{icon} {i}. {name}")
+            lines.append("\nReply with:\n• <code>/pause 1</code> — pause #1")
+            send_telegram_message("\n".join(lines), chat_id)
+        return
+
+    pause_idx = parse_pause_command(text)
+    if pause_idx is not None:
+        all_rows = products_ws.get_all_values()
+        data_count = len(all_rows) - 1
+        if pause_idx < 1 or pause_idx > data_count:
+            send_telegram_message(
+                f"⚠️ Invalid number. You have {data_count} product(s).", chat_id,
+            )
+        else:
+            name = all_rows[pause_idx][0] if len(all_rows[pause_idx]) > 0 else "?"
+            products_ws.update_cell(pause_idx + 1, 6, "paused")
+            send_telegram_message(
+                f"⏸️ Paused tracking for <b>{name}</b>.\n"
+                f"Use <code>/resume {pause_idx}</code> to resume.",
+                chat_id,
+            )
+        return
+
+    # ── /resume — Resume tracking ──
+    if text_lower.strip() == "/resume" or text_lower.strip().startswith("/resume@"):
+        all_rows = products_ws.get_all_values()
+        if len(all_rows) <= 1:
+            send_telegram_message("📋 Watchlist is empty.", chat_id)
+        else:
+            lines = ["▶️ <b>Which product to resume?</b>\n"]
+            for i, row in enumerate(all_rows[1:], 1):
+                name = row[0] if len(row) > 0 else "?"
+                status = row[5] if len(row) > 5 else "active"
+                icon = "⏸️" if status == "paused" else "🟢"
+                lines.append(f"{icon} {i}. {name}")
+            lines.append("\nReply with:\n• <code>/resume 1</code> — resume #1")
+            send_telegram_message("\n".join(lines), chat_id)
+        return
+
+    resume_idx = parse_resume_command(text)
+    if resume_idx is not None:
+        all_rows = products_ws.get_all_values()
+        data_count = len(all_rows) - 1
+        if resume_idx < 1 or resume_idx > data_count:
+            send_telegram_message(
+                f"⚠️ Invalid number. You have {data_count} product(s).", chat_id,
+            )
+        else:
+            name = all_rows[resume_idx][0] if len(all_rows[resume_idx]) > 0 else "?"
+            products_ws.update_cell(resume_idx + 1, 6, "active")
+            send_telegram_message(
+                f"▶️ Resumed tracking for <b>{name}</b>.",
+                chat_id,
+            )
+        return
+
     # ── Auto-detect URL (no /add needed) ──
     url_detected = detect_url_in_text(text)
     if url_detected:
@@ -1211,7 +1512,8 @@ def webhook():
     try:
         sheet = connect_to_sheet()
         products_ws = get_products_worksheet(sheet)
-        process_single_message(text, chat_id, products_ws)
+        history_ws = get_history_worksheet(sheet)
+        process_single_message(text, chat_id, products_ws, history_ws)
     except Exception as exc:
         log.error("Webhook processing error: %s", exc)
         send_telegram_message("❌ Something went wrong. Please try again.", chat_id)
@@ -1241,7 +1543,7 @@ def check_prices_endpoint():
 
         total = max(0, len(products_ws.get_all_values()) - 1)
         alerts, changes = phase2_check_prices(products_ws, history_ws)
-        phase3_notify([], alerts, changes, total)
+        phase3_notify([], alerts, changes, total, products_ws)
 
         return jsonify({
             "ok": True,
@@ -1269,14 +1571,14 @@ def main() -> None:
     history_ws = get_history_worksheet(sheet)
 
     # Phase 1 — Process new Telegram commands
-    added_messages = phase1_process_commands(settings_ws, products_ws)
+    added_messages = phase1_process_commands(settings_ws, products_ws, history_ws)
 
     # Phase 2 — Check all tracked prices
     total = max(0, len(products_ws.get_all_values()) - 1)
     alerts, changes = phase2_check_prices(products_ws, history_ws)
 
     # Phase 3 — Send consolidated notification
-    phase3_notify(added_messages, alerts, changes, total)
+    phase3_notify(added_messages, alerts, changes, total, products_ws)
 
     log.info("🏁 Done.")
 
