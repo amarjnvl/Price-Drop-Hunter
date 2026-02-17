@@ -1,16 +1,16 @@
 """
 Price Drop Hunter 🎯 — Telegram + Google Sheets Edition
 
-A single script with three phases:
-  Phase 1: Process new /add commands from Telegram
-  Phase 2: Check live prices for all tracked products
-  Phase 3: Send one consolidated Telegram notification
+Dual-mode operation:
+  • Webhook mode (--serve):  Flask app on Render.com for instant Telegram responses
+  • Standalone mode:         Classic 3-phase script for GitHub Actions / local runs
 
 Environment variables:
   TELEGRAM_TOKEN     – Bot token from @BotFather
   CHAT_ID            – Your Telegram chat / group ID
   GOOGLE_CREDENTIALS – Full JSON content of service account credentials
   SHEET_ID           – Google Sheet ID (from the URL)
+  WEBHOOK_SECRET     – Secret token to verify webhook requests (optional)
 """
 
 import json
@@ -22,6 +22,7 @@ import tempfile
 from pathlib import Path
 
 import requests
+from flask import Flask, request as flask_request, jsonify
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import gspread
@@ -43,6 +44,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 SHEET_ID = os.environ.get("SHEET_ID", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 HEADERS = {
     "User-Agent": (
@@ -401,10 +403,15 @@ def get_telegram_updates(last_update_id: int) -> list[dict]:
     return []
 
 
-def send_telegram_message(message: str) -> bool:
+def send_telegram_message(message: str, chat_id: str = "") -> bool:
     """Send a message via the Telegram Bot API."""
     api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {
+        "chat_id": chat_id or CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
 
     try:
         resp = requests.post(api_url, json=payload, timeout=15)
@@ -416,20 +423,133 @@ def send_telegram_message(message: str) -> bool:
         return False
 
 
-def parse_add_command(text: str) -> tuple[str, str] | None:
+def register_bot_commands() -> None:
+    """Register bot commands so they appear as a clickable menu in Telegram."""
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
+    commands = [
+        {"command": "list", "description": "📋 View your watchlist"},
+        {"command": "remove", "description": "🗑️ Remove a product (e.g. /remove 2)"},
+        {"command": "edit", "description": "✏️ Change target price (e.g. /edit 2 1500)"},
+        {"command": "status", "description": "📊 Quick summary of your watchlist"},
+        {"command": "help", "description": "❓ Show all commands"},
+    ]
+    try:
+        resp = requests.post(api_url, json={"commands": commands}, timeout=10)
+        if resp.ok:
+            log.info("✅ Bot menu commands registered.")
+        else:
+            log.warning("Could not register bot commands: %s", resp.text)
+    except requests.RequestException as exc:
+        log.warning("Could not register bot commands: %s", exc)
+
+
+# ──────────────────────── Command Parsing ─────────────────────────
+
+def detect_url_in_text(text: str) -> tuple[str, float | None] | None:
     """
-    Parse '/add <URL> <TARGET_PRICE>' from a message.
-    Returns (url, target_price) or None if the format is invalid.
+    Smart URL detection — works with or without /add prefix.
+    Supports:
+      - Just a URL:              https://flipkart.com/...
+      - URL + price:             https://flipkart.com/... 2000
+      - /add URL:                /add https://flipkart.com/...
+      - /add URL price:          /add https://flipkart.com/... 2000
+    Returns (url, target_price_or_None) or None if no URL found.
     """
-    match = re.match(r"/add\s+(https?://\S+)\s+(\d+\.?\d*)", text.strip())
+    cleaned = text.strip()
+    # Remove /add prefix if present
+    if cleaned.lower().startswith("/add"):
+        cleaned = cleaned[4:].strip()
+
+    # Find a URL in the text
+    url_match = re.search(r"(https?://\S+)", cleaned)
+    if not url_match:
+        return None
+
+    url = url_match.group(1)
+
+    # Only accept Amazon/Flipkart URLs
+    if detect_platform(url) == "unknown":
+        return None
+
+    # Look for a price number after the URL
+    after_url = cleaned[url_match.end():].strip()
+    price_match = re.match(r"(\d+\.?\d*)", after_url)
+    target_price = float(price_match.group(1)) if price_match else None
+
+    return url, target_price
+
+
+def parse_remove_command(text: str) -> str | None:
+    """Parse '/remove <n>' or '/remove all'. Returns the argument or None."""
+    match = re.match(r"/remove\s+(\S+)", text.strip(), re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def parse_edit_command(text: str) -> tuple[int, float] | None:
+    """Parse '/edit <n> <new_price>'. Returns (index, new_price) or None."""
+    match = re.match(r"/edit\s+(\d+)\s+(\d+\.?\d*)", text.strip(), re.IGNORECASE)
     if match:
-        return match.group(1), match.group(2)
+        return int(match.group(1)), float(match.group(2))
     return None
 
 
-def parse_list_command(text: str) -> bool:
-    """Check if the message is a /list command."""
-    return text.strip().lower().startswith("/list")
+def is_duplicate_url(products_ws: gspread.Worksheet, url: str) -> bool:
+    """Check if a URL is already being tracked."""
+    all_rows = products_ws.get_all_values()
+    for row in all_rows[1:]:
+        if len(row) > 1 and row[1].split("?")[0] == url.split("?")[0]:
+            return True
+    return False
+
+
+# ──────────────────────── Add Product Logic ───────────────────────
+
+def handle_add_product(
+    products_ws: gspread.Worksheet,
+    url: str,
+    target_price: float | None,
+) -> str:
+    """
+    Add a product to the watchlist. Returns a confirmation message.
+    If target_price is None, auto-sets to 15% below current price.
+    """
+    # Check for duplicate
+    if is_duplicate_url(products_ws, url):
+        return "⚠️ This product is already in your watchlist."
+
+    # Scrape the product
+    info = scrape_product_info(url)
+    if info and info.get("title"):
+        name = info["title"]
+        if len(name) > 60:
+            name = name[:57] + "..."
+    else:
+        name = f"Product ({detect_platform(url).capitalize()})"
+
+    current_price = info["price"] if info else None
+
+    # Auto-calculate target if not provided
+    if target_price is None and current_price:
+        target_price = round(current_price * 0.85)  # 15% below current
+        auto_label = " (auto: 15% below)"
+    elif target_price is None:
+        target_price = 0
+        auto_label = " (set manually later)"
+    else:
+        auto_label = ""
+
+    price_str = f"₹{current_price:,.2f}" if current_price else "N/A"
+
+    # Append to Google Sheet
+    products_ws.append_row(
+        [name, url, str(target_price), str(current_price or "N/A")]
+    )
+    log.info("   ✅ Added '%s' to sheet.", name)
+
+    return (
+        f"✅ <b>{name}</b>\n"
+        f"   Target: ₹{target_price:,.0f}{auto_label} | Current: {price_str}"
+    )
 
 
 # ══════════════════════════ THREE PHASES ══════════════════════════
@@ -440,7 +560,7 @@ def phase1_process_commands(
     products_ws: gspread.Worksheet,
 ) -> list[str]:
     """
-    Phase 1: Process new /add and /list commands from Telegram.
+    Phase 1: Process Telegram commands and auto-detected URLs.
     Returns a list of confirmation messages for newly added products.
     """
     log.info("═══ Phase 1: Processing Telegram Commands ═══")
@@ -461,56 +581,161 @@ def phase1_process_commands(
 
         message = update.get("message", {})
         text = message.get("text", "")
+        chat_id = str(message.get("chat", {}).get("id", CHAT_ID))
 
         if not text:
             continue
 
-        # ── Handle /add command ──
-        parsed = parse_add_command(text)
-        if parsed:
-            url, target_price = parsed
-            log.info("📥 /add command: %s at ₹%s", url, target_price)
+        text_lower = text.strip().lower()
 
-            # Scrape the product title
-            info = scrape_product_info(url)
-            if info and info.get("title"):
-                name = info["title"]
-                # Truncate long titles
-                if len(name) > 60:
-                    name = name[:57] + "..."
-            else:
-                # Fallback: use domain + last part of URL
-                name = f"Product ({detect_platform(url).capitalize()})"
-
-            current_price = info["price"] if info else None
-            price_str = f"₹{current_price:,.2f}" if current_price else "N/A"
-
-            # Append to Google Sheet
-            products_ws.append_row(
-                [name, url, str(target_price), str(current_price or "N/A")]
-            )
-            log.info("   ✅ Added '%s' to sheet.", name)
-
-            added_messages.append(
-                f"✅ <b>{name}</b>\n"
-                f"   Target: ₹{float(target_price):,.0f} | Current: {price_str}"
+        # ── /start — Welcome message ──
+        if text_lower.startswith("/start"):
+            send_telegram_message(
+                "🎯 <b>Welcome to Price Drop Hunter!</b>\n\n"
+                "I track prices on <b>Amazon</b> and <b>Flipkart</b> "
+                "and alert you when they drop.\n\n"
+                "<b>How to add a product:</b>\n"
+                "Just paste any Amazon/Flipkart URL!\n\n"
+                "• <code>URL</code> — auto-target 15% below current price\n"
+                "• <code>URL 2000</code> — set ₹2,000 as your target\n\n"
+                "Type /help to see all commands.",
+                chat_id,
             )
             continue
 
-        # ── Handle /list command ──
-        if parse_list_command(text):
+        # ── /help — Show all commands ──
+        if text_lower.startswith("/help"):
+            send_telegram_message(
+                "❓ <b>Available Commands</b>\n\n"
+                "<b>Add products:</b>\n"
+                "• Just paste any Flipkart/Amazon URL\n"
+                "• Add a target price after the URL\n"
+                "• Or use: <code>/add URL PRICE</code>\n\n"
+                "<b>Manage watchlist:</b>\n"
+                "• /list — View all tracked products\n"
+                "• /remove 2 — Remove product #2\n"
+                "• /remove all — Clear entire watchlist\n"
+                "• /edit 2 1500 — Change target for #2 to ₹1,500\n\n"
+                "<b>Info:</b>\n"
+                "• /status — Quick summary\n"
+                "• /help — This message\n\n"
+                "Prices are checked every hour automatically. 🕐",
+                chat_id,
+            )
+            continue
+
+        # ── /status — Quick summary ──
+        if text_lower.startswith("/status"):
+            all_rows = products_ws.get_all_values()
+            count = max(0, len(all_rows) - 1)
+            send_telegram_message(
+                f"📊 <b>Status</b>\n\n"
+                f"Products tracked: <b>{count}</b>\n"
+                f"Price checks: every 1 hour\n"
+                f"Scraping: Amazon + Flipkart",
+                chat_id,
+            )
+            continue
+
+        # ── /list — View watchlist ──
+        if text_lower.startswith("/list"):
             log.info("📋 /list command received.")
             all_rows = products_ws.get_all_values()
             if len(all_rows) <= 1:
-                send_telegram_message("📋 Your watchlist is empty.\nUse /add <URL> <TARGET_PRICE> to add products.")
+                send_telegram_message(
+                    "📋 Your watchlist is empty.\n"
+                    "Just paste any Amazon/Flipkart URL to start tracking!",
+                    chat_id,
+                )
             else:
                 lines = ["📋 <b>Your Watchlist</b>\n"]
                 for i, row in enumerate(all_rows[1:], 1):
                     name = row[0] if len(row) > 0 else "?"
                     target = row[2] if len(row) > 2 else "?"
                     current = row[3] if len(row) > 3 else "N/A"
-                    lines.append(f"{i}. <b>{name}</b>\n   Target: ₹{target} | Last: {current}")
-                send_telegram_message("\n".join(lines))
+                    lines.append(
+                        f"{i}. <b>{name}</b>\n"
+                        f"   Target: ₹{target} | Last: {current}"
+                    )
+                send_telegram_message("\n".join(lines), chat_id)
+            continue
+
+        # ── /remove — Remove product(s) ──
+        remove_arg = parse_remove_command(text)
+        if remove_arg is not None:
+            all_rows = products_ws.get_all_values()
+            data_count = len(all_rows) - 1
+
+            if remove_arg.lower() == "all":
+                if data_count <= 0:
+                    send_telegram_message("📋 Watchlist is already empty.", chat_id)
+                else:
+                    # Delete all data rows (keep header)
+                    for row_idx in range(data_count + 1, 1, -1):
+                        products_ws.delete_rows(row_idx)
+                    send_telegram_message(
+                        f"🗑️ Cleared <b>{data_count}</b> product(s) from your watchlist.",
+                        chat_id,
+                    )
+                    log.info("   🗑️ Cleared all %d products.", data_count)
+                continue
+
+            try:
+                idx = int(remove_arg)
+            except ValueError:
+                send_telegram_message(
+                    "⚠️ Usage: <code>/remove 2</code> or <code>/remove all</code>",
+                    chat_id,
+                )
+                continue
+
+            if idx < 1 or idx > data_count:
+                send_telegram_message(
+                    f"⚠️ Invalid number. You have {data_count} product(s). "
+                    f"Use /list to see them.",
+                    chat_id,
+                )
+            else:
+                removed_name = all_rows[idx][0] if len(all_rows[idx]) > 0 else "?"
+                products_ws.delete_rows(idx + 1)  # +1 for header
+                send_telegram_message(
+                    f"🗑️ Removed <b>{removed_name}</b> from your watchlist.",
+                    chat_id,
+                )
+                log.info("   🗑️ Removed row %d: '%s'", idx, removed_name)
+            continue
+
+        # ── /edit — Change target price ──
+        edit_parsed = parse_edit_command(text)
+        if edit_parsed:
+            idx, new_price = edit_parsed
+            all_rows = products_ws.get_all_values()
+            data_count = len(all_rows) - 1
+
+            if idx < 1 or idx > data_count:
+                send_telegram_message(
+                    f"⚠️ Invalid number. You have {data_count} product(s). "
+                    f"Use /list to see them.",
+                    chat_id,
+                )
+            else:
+                name = all_rows[idx][0] if len(all_rows[idx]) > 0 else "?"
+                products_ws.update_cell(idx + 1, 3, str(new_price))  # +1 for header
+                send_telegram_message(
+                    f"✏️ Updated target for <b>{name}</b> to ₹{new_price:,.0f}",
+                    chat_id,
+                )
+                log.info("   ✏️ Updated target for '%s' → ₹%.0f", name, new_price)
+            continue
+
+        # ── Auto-detect URL (no /add needed) ──
+        url_detected = detect_url_in_text(text)
+        if url_detected:
+            url, target_price = url_detected
+            log.info("📥 URL detected: %s (target: %s)", url, target_price or "auto")
+            msg = handle_add_product(products_ws, url, target_price)
+            added_messages.append(msg)
+            send_telegram_message(msg, chat_id)
             continue
 
     # Update the last processed ID
@@ -618,9 +843,254 @@ def phase3_notify(
     send_telegram_message("\n".join(lines))
 
 
+# ──────────────────── Webhook: Single Message Handler ────────────
+
+def process_single_message(
+    text: str,
+    chat_id: str,
+    products_ws: gspread.Worksheet,
+) -> None:
+    """
+    Process a single incoming Telegram message instantly.
+    Used by the webhook endpoint for real-time responses.
+    """
+    if not text:
+        return
+
+    text_lower = text.strip().lower()
+
+    # ── /start — Welcome message ──
+    if text_lower.startswith("/start"):
+        send_telegram_message(
+            "🎯 <b>Welcome to Price Drop Hunter!</b>\n\n"
+            "I track prices on <b>Amazon</b> and <b>Flipkart</b> "
+            "and alert you when they drop.\n\n"
+            "<b>How to add a product:</b>\n"
+            "Just paste any Amazon/Flipkart URL!\n\n"
+            "• <code>URL</code> — auto-target 15% below current price\n"
+            "• <code>URL 2000</code> — set ₹2,000 as your target\n\n"
+            "Type /help to see all commands.",
+            chat_id,
+        )
+        return
+
+    # ── /help — Show all commands ──
+    if text_lower.startswith("/help"):
+        send_telegram_message(
+            "❓ <b>Available Commands</b>\n\n"
+            "<b>Add products:</b>\n"
+            "• Just paste any Flipkart/Amazon URL\n"
+            "• Add a target price after the URL\n"
+            "• Or use: <code>/add URL PRICE</code>\n\n"
+            "<b>Manage watchlist:</b>\n"
+            "• /list — View all tracked products\n"
+            "• /remove 2 — Remove product #2\n"
+            "• /remove all — Clear entire watchlist\n"
+            "• /edit 2 1500 — Change target for #2 to ₹1,500\n\n"
+            "<b>Info:</b>\n"
+            "• /status — Quick summary\n"
+            "• /help — This message\n\n"
+            "Prices are checked every hour automatically. 🕐",
+            chat_id,
+        )
+        return
+
+    # ── /status — Quick summary ──
+    if text_lower.startswith("/status"):
+        all_rows = products_ws.get_all_values()
+        count = max(0, len(all_rows) - 1)
+        send_telegram_message(
+            f"📊 <b>Status</b>\n\n"
+            f"Products tracked: <b>{count}</b>\n"
+            f"Price checks: every 1 hour\n"
+            f"Scraping: Amazon + Flipkart",
+            chat_id,
+        )
+        return
+
+    # ── /list — View watchlist ──
+    if text_lower.startswith("/list"):
+        log.info("📋 /list command received.")
+        all_rows = products_ws.get_all_values()
+        if len(all_rows) <= 1:
+            send_telegram_message(
+                "📋 Your watchlist is empty.\n"
+                "Just paste any Amazon/Flipkart URL to start tracking!",
+                chat_id,
+            )
+        else:
+            lines = ["📋 <b>Your Watchlist</b>\n"]
+            for i, row in enumerate(all_rows[1:], 1):
+                name = row[0] if len(row) > 0 else "?"
+                target = row[2] if len(row) > 2 else "?"
+                current = row[3] if len(row) > 3 else "N/A"
+                lines.append(
+                    f"{i}. <b>{name}</b>\n"
+                    f"   Target: ₹{target} | Last: {current}"
+                )
+            send_telegram_message("\n".join(lines), chat_id)
+        return
+
+    # ── /remove — Remove product(s) ──
+    remove_arg = parse_remove_command(text)
+    if remove_arg is not None:
+        all_rows = products_ws.get_all_values()
+        data_count = len(all_rows) - 1
+
+        if remove_arg.lower() == "all":
+            if data_count <= 0:
+                send_telegram_message("📋 Watchlist is already empty.", chat_id)
+            else:
+                for row_idx in range(data_count + 1, 1, -1):
+                    products_ws.delete_rows(row_idx)
+                send_telegram_message(
+                    f"🗑️ Cleared <b>{data_count}</b> product(s) from your watchlist.",
+                    chat_id,
+                )
+                log.info("   🗑️ Cleared all %d products.", data_count)
+            return
+
+        try:
+            idx = int(remove_arg)
+        except ValueError:
+            send_telegram_message(
+                "⚠️ Usage: <code>/remove 2</code> or <code>/remove all</code>",
+                chat_id,
+            )
+            return
+
+        if idx < 1 or idx > data_count:
+            send_telegram_message(
+                f"⚠️ Invalid number. You have {data_count} product(s). "
+                f"Use /list to see them.",
+                chat_id,
+            )
+        else:
+            removed_name = all_rows[idx][0] if len(all_rows[idx]) > 0 else "?"
+            products_ws.delete_rows(idx + 1)
+            send_telegram_message(
+                f"🗑️ Removed <b>{removed_name}</b> from your watchlist.",
+                chat_id,
+            )
+            log.info("   🗑️ Removed row %d: '%s'", idx, removed_name)
+        return
+
+    # ── /edit — Change target price ──
+    edit_parsed = parse_edit_command(text)
+    if edit_parsed:
+        idx, new_price = edit_parsed
+        all_rows = products_ws.get_all_values()
+        data_count = len(all_rows) - 1
+
+        if idx < 1 or idx > data_count:
+            send_telegram_message(
+                f"⚠️ Invalid number. You have {data_count} product(s). "
+                f"Use /list to see them.",
+                chat_id,
+            )
+        else:
+            name = all_rows[idx][0] if len(all_rows[idx]) > 0 else "?"
+            products_ws.update_cell(idx + 1, 3, str(new_price))
+            send_telegram_message(
+                f"✏️ Updated target for <b>{name}</b> to ₹{new_price:,.0f}",
+                chat_id,
+            )
+            log.info("   ✏️ Updated target for '%s' → ₹%.0f", name, new_price)
+        return
+
+    # ── Auto-detect URL (no /add needed) ──
+    url_detected = detect_url_in_text(text)
+    if url_detected:
+        url, target_price = url_detected
+        log.info("📥 URL detected: %s (target: %s)", url, target_price or "auto")
+        msg = handle_add_product(products_ws, url, target_price)
+        send_telegram_message(msg, chat_id)
+        return
+
+
+# ──────────────────────────── Flask App ───────────────────────────
+
+app = Flask(__name__)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint."""
+    return jsonify({"status": "ok", "service": "price-drop-hunter"})
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    """
+    Telegram webhook — processes a single incoming message instantly.
+    """
+    # Verify secret token (if configured)
+    if WEBHOOK_SECRET:
+        token = flask_request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if token != WEBHOOK_SECRET:
+            log.warning("⚠️ Webhook: invalid secret token.")
+            return jsonify({"error": "unauthorized"}), 403
+
+    data = flask_request.get_json(silent=True) or {}
+    message = data.get("message", {})
+    text = message.get("text", "")
+    chat_id = str(message.get("chat", {}).get("id", CHAT_ID))
+
+    if not text:
+        return jsonify({"ok": True})
+
+    log.info("📨 Webhook message from %s: %s", chat_id, text[:80])
+
+    try:
+        sheet = connect_to_sheet()
+        products_ws = get_products_worksheet(sheet)
+        process_single_message(text, chat_id, products_ws)
+    except Exception as exc:
+        log.error("Webhook processing error: %s", exc)
+        send_telegram_message("❌ Something went wrong. Please try again.", chat_id)
+
+    return jsonify({"ok": True})
+
+
+@app.route("/check-prices", methods=["POST"])
+def check_prices_endpoint():
+    """
+    Triggered by GitHub Actions (hourly) to check all prices
+    and send notifications.
+    """
+    # Verify authorization
+    if WEBHOOK_SECRET:
+        auth = flask_request.headers.get("Authorization", "")
+        if auth != f"Bearer {WEBHOOK_SECRET}":
+            return jsonify({"error": "unauthorized"}), 403
+
+    log.info("⏰ Price check triggered via /check-prices endpoint.")
+
+    try:
+        validate_config()
+        sheet = connect_to_sheet()
+        products_ws = get_products_worksheet(sheet)
+
+        alerts = phase2_check_prices(products_ws)
+        phase3_notify([], alerts)
+
+        return jsonify({
+            "ok": True,
+            "products_checked": len(products_ws.get_all_values()) - 1,
+            "alerts": len(alerts),
+        })
+    except Exception as exc:
+        log.error("Price check error: %s", exc)
+        return jsonify({"error": str(exc)}), 500
+
+
 # ──────────────────────────── Main ───────────────────────────────
 def main() -> None:
+    """Classic standalone mode: process commands + check prices + notify."""
     validate_config()
+
+    # Register bot commands (creates the clickable menu in Telegram)
+    register_bot_commands()
 
     # Connect to Google Sheets
     sheet = connect_to_sheet()
@@ -639,5 +1109,41 @@ def main() -> None:
     log.info("🏁 Done.")
 
 
+def setup_telegram_webhook(render_url: str) -> None:
+    """Register the Telegram webhook to point to our Render URL."""
+    webhook_url = f"{render_url.rstrip('/')}/webhook"
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook"
+    payload = {
+        "url": webhook_url,
+        "allowed_updates": ["message"],
+    }
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+
+    resp = requests.post(api_url, json=payload, timeout=10)
+    if resp.ok:
+        log.info("✅ Telegram webhook set to: %s", webhook_url)
+    else:
+        log.error("❌ Failed to set webhook: %s", resp.text)
+
+
 if __name__ == "__main__":
-    main()
+    if "--serve" in sys.argv:
+        # Webhook server mode (for local testing)
+        validate_config()
+        register_bot_commands()
+        # Set up webhook if Render URL provided
+        render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+        if render_url:
+            setup_telegram_webhook(render_url)
+        port = int(os.environ.get("PORT", 5000))
+        log.info("🚀 Starting webhook server on port %d", port)
+        app.run(host="0.0.0.0", port=port, debug=True)
+    elif "--set-webhook" in sys.argv:
+        # One-time: set the Telegram webhook URL
+        validate_config()
+        render_url = sys.argv[sys.argv.index("--set-webhook") + 1]
+        setup_telegram_webhook(render_url)
+    else:
+        # Classic standalone mode (GitHub Actions / local testing)
+        main()
