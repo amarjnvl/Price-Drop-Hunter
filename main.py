@@ -670,7 +670,7 @@ def handle_news_command(topic: str, chat_id: str) -> None:
 
     # 2. Summarize with Gemini
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
     prompt = (
         f"You are a fun news anchor. Summarize these headlines about "
         f"'{final_topic}' in under 100 words. Use emojis. Keep it casual and "
