@@ -23,7 +23,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
-from curl_cffi import requests as browser_requests
 from flask import Flask, request as flask_request, jsonify
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -190,18 +189,10 @@ def detect_platform(url: str) -> str:
 def fetch_page(url: str) -> BeautifulSoup | None:
     """Fetch a URL and return a BeautifulSoup object."""
     try:
-        # Use curl_cffi to mimic a real browser (Chrome 110 to avoid some latest TLS blocks)
-        # This helps bypass 403 Forbidden errors on sites like Flipkart
-        resp = browser_requests.get(url, headers=HEADERS, impersonate="chrome110", timeout=30)
-        
-        # Handle 429 explicitly to warn user
-        if resp.status_code == 429:
-             log.warning("⚠️  Rate limited (429) for %s. Try pausing for a while.", url)
-             return None
-             
+        resp = requests.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "html.parser")
-    except Exception as exc:
+    except requests.RequestException as exc:
         log.error("HTTP request failed for %s: %s", url, exc)
         return None
 
@@ -423,10 +414,8 @@ def scrape_product_info(url: str) -> dict | None:
 
     # Strategy 1: Direct request (works for Amazon, works locally for Flipkart)
     try:
-        resp = browser_requests.get(url, headers=HEADERS, impersonate="chrome110", timeout=30)
-        if resp.status_code == 429:
-            log.warning("⚠️  Rate limited (429) for %s. Try again later.", url)
-        elif resp.ok:
+        resp = requests.get(url, headers=HEADERS, timeout=30)
+        if resp.ok:
             html_text = resp.text
             log.info("   ✅ Direct request succeeded for %s", platform)
     except Exception as exc:
@@ -443,7 +432,7 @@ def scrape_product_info(url: str) -> dict | None:
         for i, proxy_url in enumerate(proxy_urls, 1):
             try:
                 log.info("   🔄 Trying proxy %d for Flipkart...", i)
-                resp = browser_requests.get(proxy_url, impersonate="chrome110", timeout=30)
+                resp = requests.get(proxy_url, headers=HEADERS, timeout=30)
                 if resp.ok and len(resp.text) > 1000:
                     html_text = resp.text
                     log.info("   ✅ Proxy %d succeeded (%d chars)", i, len(html_text))

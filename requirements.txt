@@ -5,4 +5,4 @@ gspread
 google-auth
 flask
 gunicorn
-curl_cffi
+
