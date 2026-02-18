@@ -418,20 +418,47 @@ def scrape_product_info(url: str) -> dict | None:
         log.warning("Unsupported platform: %s", url)
         return None
 
+    # ── Fetch the page ──────────────────────────────────────────────
+    html_text = None
+
+    # Strategy 1: Direct request (works for Amazon, works locally for Flipkart)
     try:
-        # Use curl_cffi to bypass TLS fingerprinting blocks (e.g. Flipkart 403)
         resp = browser_requests.get(url, headers=HEADERS, impersonate="chrome110", timeout=30)
         if resp.status_code == 429:
             log.warning("⚠️  Rate limited (429) for %s. Try again later.", url)
-            return None
-        resp.raise_for_status()
+        elif resp.ok:
+            html_text = resp.text
+            log.info("   ✅ Direct request succeeded for %s", platform)
     except Exception as exc:
-        log.error("HTTP request failed for %s: %s", url, exc)
+        log.warning("   ⚠️  Direct request failed for %s: %s", url, exc)
+
+    # Strategy 2: Free proxy fallback (for Flipkart on cloud servers like Render)
+    if html_text is None and platform == "flipkart":
+        import urllib.parse
+        encoded_url = urllib.parse.quote(url, safe="")
+        proxy_urls = [
+            f"https://api.allorigins.win/raw?url={encoded_url}",
+            f"https://api.codetabs.com/v1/proxy?quest={url}",
+        ]
+        for i, proxy_url in enumerate(proxy_urls, 1):
+            try:
+                log.info("   🔄 Trying proxy %d for Flipkart...", i)
+                resp = browser_requests.get(proxy_url, impersonate="chrome110", timeout=30)
+                if resp.ok and len(resp.text) > 1000:
+                    html_text = resp.text
+                    log.info("   ✅ Proxy %d succeeded (%d chars)", i, len(html_text))
+                    break
+                else:
+                    log.warning("   ⚠️  Proxy %d returned short/bad response (%d chars)", i, len(resp.text))
+            except Exception as exc:
+                log.warning("   ⚠️  Proxy %d failed: %s", i, exc)
+
+    if html_text is None:
+        log.error("❌ All fetch strategies failed for %s", url)
         return None
 
-    html_text = resp.text
-    log.info("   📄 HTTP %d | %d chars | JSON-LD: %s | ₹: %s",
-             resp.status_code, len(html_text),
+    log.info("   📄 %d chars | JSON-LD: %s | ₹: %s",
+             len(html_text),
              "YES" if "application/ld+json" in html_text else "NO",
              "YES" if "₹" in html_text else "NO")
 
