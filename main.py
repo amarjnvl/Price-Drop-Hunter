@@ -764,14 +764,115 @@ def handle_news_command(raw_topic: str, chat_id: str) -> None:
         for e in entries
     )
 
-    # 4. Send
+    # 4. News-to-Price bridge — check if topic relates to any tracked product
+    bridge_note = ""
+    try:
+        if GOOGLE_CREDENTIALS and SHEET_ID:
+            sheet = connect_to_sheet()
+            products_ws = get_products_worksheet(sheet)
+            rows = products_ws.get_all_values()[1:]  # skip header
+            topic_lower = topic.lower()
+            for row in rows:
+                if len(row) >= 4 and row[0]:
+                    product_name = row[0].lower()
+                    if (topic_lower in product_name or
+                            any(w in product_name for w in topic_lower.split() if len(w) > 3)):
+                        price_str = row[3] if row[3] else "N/A"
+                        bridge_note += f"\n📌 <i>Related: You're tracking <b>{row[0]}</b> (₹{price_str})</i>"
+    except Exception as exc:
+        log.debug("News-to-price bridge skipped: %s", exc)
+
+    # 5. Check & save news history (dedup)
+    history_note = ""
+    try:
+        if GOOGLE_CREDENTIALS and SHEET_ID:
+            import hashlib
+            headlines_hash = hashlib.md5(headlines.encode()).hexdigest()[:12]
+            sheet = connect_to_sheet()
+            news_hist_ws = get_news_history_worksheet(sheet)
+            existing = news_hist_ws.get_all_values()[1:]  # skip header
+            # Check if same hash exists for this topic in last 10 entries
+            for row in reversed(existing[-10:]):
+                if len(row) >= 3 and row[1] == topic and row[2] == headlines_hash:
+                    history_note = "\n\n🔁 <i>Same headlines as your last check — no new updates.</i>"
+                    break
+            if not history_note:
+                now_str = now_ist().strftime("%Y-%m-%d %H:%M")
+                news_hist_ws.append_row([now_str, topic, headlines_hash])
+    except Exception as exc:
+        log.debug("News history check skipped: %s", exc)
+
+    # 6. Send
     lang_tag = f" ({language})" if language != "English" else ""
     send_telegram_message(
         f"📰 <b>News: {topic}</b>{lang_tag}  [{mode_label}]\n\n"
         f"{summary}\n\n"
-        f"🔗 <b>Sources</b>\n{links}\n\n"
+        f"🔗 <b>Sources</b>\n{links}"
+        f"{bridge_note}{history_note}\n\n"
         f"— <i>Powered by Gemini ✨</i>", chat_id)
 
+
+def get_news_topics_worksheet(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
+    """Get or create the 'News_Topics' tab for saved topics."""
+    try:
+        ws = sheet.worksheet("News_Topics")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title="News_Topics", rows=50, cols=2)
+        ws.update("A1:B1", [["Topic", "Added_Date"]])
+        log.info("Created 'News_Topics' tab.")
+    return ws
+
+
+def get_news_history_worksheet(sheet: gspread.Spreadsheet) -> gspread.Worksheet:
+    """Get or create the 'News_History' tab for dedup tracking."""
+    try:
+        ws = sheet.worksheet("News_History")
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title="News_History", rows=500, cols=3)
+        ws.update("A1:C1", [["Date", "Topic", "Headlines_Hash"]])
+        log.info("Created 'News_History' tab.")
+    return ws
+
+
+def handle_news_save(topic: str, chat_id: str) -> None:
+    """Save a topic to the News_Topics sheet."""
+    if not topic.strip():
+        send_telegram_message("⚠️ Usage: <code>/news save Cricket</code>", chat_id)
+        return
+    try:
+        sheet = connect_to_sheet()
+        ws = get_news_topics_worksheet(sheet)
+        # Check for duplicates
+        existing = ws.col_values(1)[1:]  # skip header
+        if topic.strip().lower() in [t.lower() for t in existing]:
+            send_telegram_message(f"ℹ️ <b>{topic.strip()}</b> is already saved.", chat_id)
+            return
+        now_str = now_ist().strftime("%Y-%m-%d %H:%M")
+        ws.append_row([topic.strip(), now_str])
+        send_telegram_message(f"✅ Saved topic: <b>{topic.strip()}</b>\n\nUse /news saved to get all your saved topics.", chat_id)
+    except Exception as exc:
+        log.error("Failed to save news topic: %s", exc)
+        send_telegram_message("❌ Failed to save topic.", chat_id)
+
+
+def handle_news_saved(chat_id: str) -> None:
+    """Fetch news for all saved topics."""
+    try:
+        sheet = connect_to_sheet()
+        ws = get_news_topics_worksheet(sheet)
+        topics = ws.col_values(1)[1:]  # skip header
+    except Exception as exc:
+        log.error("Failed to read saved topics: %s", exc)
+        send_telegram_message("❌ Failed to read saved topics.", chat_id)
+        return
+
+    if not topics:
+        send_telegram_message("📭 No saved topics yet.\n\nUse <code>/news save Cricket</code> to add one.", chat_id)
+        return
+
+    send_telegram_message(f"📰 Fetching news for {len(topics)} saved topics...", chat_id)
+    for t in topics:
+        handle_news_command(t, chat_id)
 
 
 # ══════════════════════════ THREE PHASES ══════════════════════════
@@ -813,8 +914,13 @@ def phase1_process_commands(
 
         # ── /news — AI News Summary ──
         if text_lower.startswith("/news"):
-            topic = text[5:].strip()
-            handle_news_command(topic, chat_id)
+            args = text[5:].strip()
+            if text_lower.startswith("/news saved"):
+                handle_news_saved(chat_id)
+            elif text_lower.startswith("/news save"):
+                handle_news_save(args[5:].strip(), chat_id)
+            else:
+                handle_news_command(args, chat_id)
             continue
 
         # ── /start — Welcome message ──
@@ -851,6 +957,7 @@ def phase1_process_commands(
                 "• /history 1 — Price history for #1\n"
                 "• /status — Quick summary\n"
                 "• /news <topic> — AI news (try: tech, sports, detail)\n"
+                "• /news save <topic> / saved — Save & fetch topics\n"
                 "• /help — This message\n\n"
                 "Prices are checked every hour automatically. 🕐",
                 chat_id,
@@ -1327,8 +1434,13 @@ def process_single_message(
 
     # ── /news — AI News Summary ──
     if text_lower.startswith("/news"):
-        topic = text[5:].strip()
-        handle_news_command(topic, chat_id)
+        args = text[5:].strip()
+        if text_lower.startswith("/news saved"):
+            handle_news_saved(chat_id)
+        elif text_lower.startswith("/news save"):
+            handle_news_save(args[5:].strip(), chat_id)
+        else:
+            handle_news_command(args, chat_id)
         return
 
     # ── /start — Welcome message ──
@@ -1365,6 +1477,7 @@ def process_single_message(
             "• /history 1 — Price history for #1\n"
             "• /status — Quick summary\n"
             "• /news <topic> — AI news (try: tech, sports, detail)\n"
+            "• /news save <topic> / saved — Save & fetch topics\n"
             "• /help — This message\n\n"
             "Prices are checked every hour automatically. 🕐",
             chat_id,
