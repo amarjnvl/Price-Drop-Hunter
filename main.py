@@ -46,6 +46,7 @@ CHAT_ID = os.environ.get("CHAT_ID", "")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 SHEET_ID = os.environ.get("SHEET_ID", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+PROXY_WORKER_URL = os.environ.get("PROXY_WORKER_URL", "")  # Cloudflare Worker proxy for Flipkart
 
 # Indian Standard Time (UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -421,26 +422,21 @@ def scrape_product_info(url: str) -> dict | None:
     except Exception as exc:
         log.warning("   ⚠️  Direct request failed for %s: %s", url, exc)
 
-    # Strategy 2: Free proxy fallback (for Flipkart on cloud servers like Render)
-    if html_text is None and platform == "flipkart":
+    # Strategy 2: Cloudflare Worker proxy (for Flipkart on cloud servers like Render)
+    if html_text is None and platform == "flipkart" and PROXY_WORKER_URL:
         import urllib.parse
         encoded_url = urllib.parse.quote(url, safe="")
-        proxy_urls = [
-            f"https://api.allorigins.win/raw?url={encoded_url}",
-            f"https://api.codetabs.com/v1/proxy?quest={url}",
-        ]
-        for i, proxy_url in enumerate(proxy_urls, 1):
-            try:
-                log.info("   🔄 Trying proxy %d for Flipkart...", i)
-                resp = requests.get(proxy_url, headers=HEADERS, timeout=30)
-                if resp.ok and len(resp.text) > 1000:
-                    html_text = resp.text
-                    log.info("   ✅ Proxy %d succeeded (%d chars)", i, len(html_text))
-                    break
-                else:
-                    log.warning("   ⚠️  Proxy %d returned short/bad response (%d chars)", i, len(resp.text))
-            except Exception as exc:
-                log.warning("   ⚠️  Proxy %d failed: %s", i, exc)
+        proxy_url = f"{PROXY_WORKER_URL}?url={encoded_url}"
+        try:
+            log.info("   🔄 Trying Cloudflare Worker proxy for Flipkart...")
+            resp = requests.get(proxy_url, timeout=30)
+            if resp.ok and len(resp.text) > 1000:
+                html_text = resp.text
+                log.info("   ✅ Proxy succeeded (%d chars)", len(html_text))
+            else:
+                log.warning("   ⚠️  Proxy returned short/bad response (%d chars)", len(resp.text))
+        except Exception as exc:
+            log.warning("   ⚠️  Proxy failed: %s", exc)
 
     if html_text is None:
         log.error("❌ All fetch strategies failed for %s", url)
