@@ -26,6 +26,7 @@ Phase 3: Sends ONE consolidated Telegram message with alerts
 |---------|---------|--------------|
 | `/add <URL> <PRICE>` | `/add https://amazon.in/dp/B0CHX1W1XY 55000` | Adds product to your watchlist |
 | `/list` | `/list` | Shows all tracked products |
+| `/news <topic>` | `/news Cricket` | Get AI summary of latest news |
 
 ---
 
@@ -85,6 +86,7 @@ Go to **Settings → Secrets and variables → Actions** and add:
 | `CHAT_ID` | Your Telegram chat ID |
 | `SHEET_ID` | Google Sheet ID from the URL |
 | `GOOGLE_CREDENTIALS` | **Paste the ENTIRE content** of `credentials.json` as a single-line string |
+| `GEMINI_API_KEY` | Get from [Google AI Studio](https://aistudio.google.com/apikey) |
 
 > **How to save `credentials.json` as a secret:**
 > Open the file in a text editor, select all (`Ctrl+A`), copy (`Ctrl+C`), then paste directly into the GitHub Secret value field. It handles the JSON formatting automatically.
@@ -108,6 +110,7 @@ TELEGRAM_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v
 CHAT_ID=987654321
 SHEET_ID=your_google_sheet_id_here
 GOOGLE_CREDENTIALS={"type":"service_account","project_id":"...full JSON here..."}
+GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
 Run:

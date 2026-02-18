@@ -28,6 +28,8 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import gspread
 from google.oauth2.service_account import Credentials
+import feedparser
+import google.generativeai as genai
 
 # Load .env file (for local testing; ignored in GitHub Actions)
 load_dotenv()
@@ -46,6 +48,7 @@ CHAT_ID = os.environ.get("CHAT_ID", "")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 SHEET_ID = os.environ.get("SHEET_ID", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 # Indian Standard Time (UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -478,6 +481,7 @@ def register_bot_commands() -> None:
         {"command": "pause", "description": "⏸️ Pause tracking"},
         {"command": "resume", "description": "▶️ Resume tracking"},
         {"command": "status", "description": "📊 Quick summary"},
+        {"command": "news", "description": "📰 AI news summary"},
         {"command": "help", "description": "❓ Show all commands"},
     ]
     try:
@@ -632,6 +636,61 @@ def handle_add_product(
     )
 
 
+# ──────────────────────── News Logic ───────────────────────
+
+def handle_news_command(topic: str, chat_id: str) -> None:
+    """Fetch Google News RSS for a topic and summarize with Gemini."""
+    if not GEMINI_API_KEY:
+        send_telegram_message(
+            "⚠️ News feature is not configured. "
+            "Set the GEMINI_API_KEY environment variable.", chat_id)
+        return
+
+    # Default to 'Technology' if no topic provided
+    final_topic = topic.strip() or "Technology"
+
+    # 1. Fetch RSS
+    # Using specific Google News RSS URL format
+    from urllib.parse import quote
+    rss_url = f"https://news.google.com/rss/search?q={quote(final_topic)}&hl=en-IN&gl=IN&ceid=IN:en"
+    
+    try:
+        feed = feedparser.parse(rss_url)
+    except Exception as exc:
+        log.error("RSS fetch error: %s", exc)
+        send_telegram_message("❌ Failed to fetch news.", chat_id)
+        return
+
+    entries = feed.entries[:3]
+    if not entries:
+        send_telegram_message(f"📰 No news found for <b>{final_topic}</b>.", chat_id)
+        return
+
+    headlines = "\n".join(f"- {e.title}" for e in entries)
+
+    # 2. Summarize with Gemini
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    prompt = (
+        f"You are a fun news anchor. Summarize these headlines about "
+        f"'{final_topic}' in under 100 words. Use emojis. Keep it casual and "
+        f"informative. Do not include introductory phrases like 'Here is the summary'.\n\n{headlines}"
+    )
+    
+    try:
+        response = model.generate_content(prompt)
+        summary = response.text.strip()
+    except Exception as exc:
+        log.error("Gemini API error: %s", exc)
+        # Fallback: just show headlines
+        summary = f"⚠️ AI summary failed. Here are the headlines:\n\n{headlines}"
+
+    # 3. Send
+    send_telegram_message(
+        f"📰 <b>News: {final_topic}</b>\n\n{summary}\n\n"
+        f"— <i>Powered by Gemini ✨</i>", chat_id)
+
+
 # ══════════════════════════ THREE PHASES ══════════════════════════
 
 
@@ -669,6 +728,12 @@ def phase1_process_commands(
 
         text_lower = text.strip().lower()
 
+        # ── /news — AI News Summary ──
+        if text_lower.startswith("/news"):
+            topic = text[5:].strip()
+            handle_news_command(topic, chat_id)
+            continue
+
         # ── /start — Welcome message ──
         if text_lower.startswith("/start"):
             send_telegram_message(
@@ -702,6 +767,7 @@ def phase1_process_commands(
                 "<b>Info:</b>\n"
                 "• /history 1 — Price history for #1\n"
                 "• /status — Quick summary\n"
+                "• /news <topic> — AI news summary\n"
                 "• /help — This message\n\n"
                 "Prices are checked every hour automatically. 🕐",
                 chat_id,
@@ -1176,6 +1242,12 @@ def process_single_message(
 
     text_lower = text.strip().lower()
 
+    # ── /news — AI News Summary ──
+    if text_lower.startswith("/news"):
+        topic = text[5:].strip()
+        handle_news_command(topic, chat_id)
+        return
+
     # ── /start — Welcome message ──
     if text_lower.startswith("/start"):
         send_telegram_message(
@@ -1209,6 +1281,7 @@ def process_single_message(
             "<b>Info:</b>\n"
             "• /history 1 — Price history for #1\n"
             "• /status — Quick summary\n"
+            "• /news <topic> — AI news summary\n"
             "• /help — This message\n\n"
             "Prices are checked every hour automatically. 🕐",
             chat_id,

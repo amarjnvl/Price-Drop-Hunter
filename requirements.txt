@@ -5,4 +5,5 @@ gspread
 google-auth
 flask
 gunicorn
-
+feedparser
+google-generativeai
