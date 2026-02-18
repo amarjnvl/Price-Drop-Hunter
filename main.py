@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+from curl_cffi import requests as browser_requests
 from flask import Flask, request as flask_request, jsonify
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -189,10 +190,18 @@ def detect_platform(url: str) -> str:
 def fetch_page(url: str) -> BeautifulSoup | None:
     """Fetch a URL and return a BeautifulSoup object."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
+        # Use curl_cffi to mimic a real browser (Chrome 110 to avoid some latest TLS blocks)
+        # This helps bypass 403 Forbidden errors on sites like Flipkart
+        resp = browser_requests.get(url, headers=HEADERS, impersonate="chrome110", timeout=30)
+        
+        # Handle 429 explicitly to warn user
+        if resp.status_code == 429:
+             log.warning("⚠️  Rate limited (429) for %s. Try pausing for a while.", url)
+             return None
+             
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "html.parser")
-    except requests.RequestException as exc:
+    except Exception as exc:
         log.error("HTTP request failed for %s: %s", url, exc)
         return None
 
