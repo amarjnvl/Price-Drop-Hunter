@@ -419,9 +419,13 @@ def scrape_product_info(url: str) -> dict | None:
         return None
 
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
+        # Use curl_cffi to bypass TLS fingerprinting blocks (e.g. Flipkart 403)
+        resp = browser_requests.get(url, headers=HEADERS, impersonate="chrome110", timeout=30)
+        if resp.status_code == 429:
+            log.warning("⚠️  Rate limited (429) for %s. Try again later.", url)
+            return None
         resp.raise_for_status()
-    except requests.RequestException as exc:
+    except Exception as exc:
         log.error("HTTP request failed for %s: %s", url, exc)
         return None
 
