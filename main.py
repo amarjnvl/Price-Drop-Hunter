@@ -17,7 +17,9 @@ import json
 import os
 import re
 import sys
+import html
 import logging
+import hashlib
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -734,6 +736,7 @@ def handle_news_command(raw_topic: str, chat_id: str) -> None:
         return
 
     headlines = "\n".join(f"- {e.title}" for e in entries)
+    safe_topic = html.escape(topic)
 
     # 2. Summarize with Gemini
     genai.configure(api_key=GEMINI_API_KEY)
@@ -760,7 +763,7 @@ def handle_news_command(raw_topic: str, chat_id: str) -> None:
 
     # 3. Build source links
     links = "\n".join(
-        f'  • <a href="{e.link}">{e.title[:50]}{"…" if len(e.title) > 50 else ""}</a>'
+        f'  • <a href="{html.escape(e.link, quote=True)}">{html.escape(e.title[:50])}{"…" if len(e.title) > 50 else ""}</a>'
         for e in entries
     )
 
@@ -778,7 +781,7 @@ def handle_news_command(raw_topic: str, chat_id: str) -> None:
                     if (topic_lower in product_name or
                             any(w in product_name for w in topic_lower.split() if len(w) > 3)):
                         price_str = row[3] if row[3] else "N/A"
-                        bridge_note += f"\n📌 <i>Related: You're tracking <b>{row[0]}</b> (₹{price_str})</i>"
+                        bridge_note += f"\n📌 <i>Related: You're tracking <b>{html.escape(row[0])}</b> (₹{html.escape(price_str)})</i>"
     except Exception as exc:
         log.debug("News-to-price bridge skipped: %s", exc)
 
@@ -786,8 +789,7 @@ def handle_news_command(raw_topic: str, chat_id: str) -> None:
     history_note = ""
     try:
         if GOOGLE_CREDENTIALS and SHEET_ID:
-            import hashlib
-            headlines_hash = hashlib.md5(headlines.encode()).hexdigest()[:12]
+            headlines_hash = hashlib.sha256(headlines.encode("utf-8")).hexdigest()
             sheet = connect_to_sheet()
             news_hist_ws = get_news_history_worksheet(sheet)
             existing = news_hist_ws.get_all_values()[1:]  # skip header
@@ -804,9 +806,10 @@ def handle_news_command(raw_topic: str, chat_id: str) -> None:
 
     # 6. Send
     lang_tag = f" ({language})" if language != "English" else ""
+    safe_summary = html.escape(summary)
     send_telegram_message(
-        f"📰 <b>News: {topic}</b>{lang_tag}  [{mode_label}]\n\n"
-        f"{summary}\n\n"
+        f"📰 <b>News: {safe_topic}</b>{lang_tag}  [{mode_label}]\n\n"
+        f"{safe_summary}\n\n"
         f"🔗 <b>Sources</b>\n{links}"
         f"{bridge_note}{history_note}\n\n"
         f"— <i>Powered by Gemini ✨</i>", chat_id)
@@ -1153,15 +1156,13 @@ def handle_news_voice(raw_topic: str, chat_id: str) -> None:
     send_telegram_message(f"🎙️ Generating voice summary for <b>{topic}</b>...", chat_id)
 
     # Generate audio
-    import tempfile
     try:
         from gtts import gTTS
         tts = gTTS(text=summary, lang="en", slow=False)
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             tts.save(tmp.name)
             send_telegram_voice(tmp.name, chat_id, caption=f"📰 News: {topic}")
-        import os as _os
-        _os.unlink(tmp.name)
+        os.unlink(tmp.name)
     except Exception as exc:
         log.error("TTS error: %s", exc)
         send_telegram_message(f"⚠️ Voice generation failed. Here's the text:\n\n{summary}", chat_id)
@@ -1239,13 +1240,11 @@ def handle_news_card(raw_topic: str, chat_id: str) -> None:
 
     headlines = [e.title for e in entries]
 
-    import tempfile
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             generate_news_card_image(topic, headlines, tmp.name)
             send_telegram_photo(tmp.name, chat_id, caption=f"📰 News: {topic}")
-        import os as _os
-        _os.unlink(tmp.name)
+        os.unlink(tmp.name)
     except Exception as exc:
         log.error("News card error: %s", exc)
         send_telegram_message("⚠️ Failed to generate news card.", chat_id)
