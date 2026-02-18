@@ -422,14 +422,14 @@ def scrape_product_info(url: str) -> dict | None:
     except Exception as exc:
         log.warning("   ⚠️  Direct request failed for %s: %s", url, exc)
 
-    # Strategy 2: Cloudflare Worker proxy (for Flipkart on cloud servers like Render)
+    # Strategy 2: External proxy (Google Apps Script / Cloudflare Worker)
     if html_text is None and platform == "flipkart" and PROXY_WORKER_URL:
         import urllib.parse
         encoded_url = urllib.parse.quote(url, safe="")
         proxy_url = f"{PROXY_WORKER_URL}?url={encoded_url}"
         try:
-            log.info("   🔄 Trying Cloudflare Worker proxy for Flipkart...")
-            resp = requests.get(proxy_url, timeout=30)
+            log.info("   🔄 Trying proxy for Flipkart...")
+            resp = requests.get(proxy_url, timeout=60)
             if resp.ok and len(resp.text) > 1000:
                 html_text = resp.text
                 log.info("   ✅ Proxy succeeded (%d chars)", len(html_text))
