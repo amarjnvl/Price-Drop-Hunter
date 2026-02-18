@@ -46,7 +46,6 @@ CHAT_ID = os.environ.get("CHAT_ID", "")
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS", "")
 SHEET_ID = os.environ.get("SHEET_ID", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-PROXY_WORKER_URL = os.environ.get("PROXY_WORKER_URL", "")  # Cloudflare Worker proxy for Flipkart
 
 # Indian Standard Time (UTC+5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -410,40 +409,16 @@ def scrape_product_info(url: str) -> dict | None:
         log.warning("Unsupported platform: %s", url)
         return None
 
-    # ── Fetch the page ──────────────────────────────────────────────
-    html_text = None
-
-    # Strategy 1: Direct request (works for Amazon, works locally for Flipkart)
     try:
         resp = requests.get(url, headers=HEADERS, timeout=30)
-        if resp.ok:
-            html_text = resp.text
-            log.info("   ✅ Direct request succeeded for %s", platform)
-    except Exception as exc:
-        log.warning("   ⚠️  Direct request failed for %s: %s", url, exc)
-
-    # Strategy 2: External proxy (Google Apps Script / Cloudflare Worker)
-    if html_text is None and platform == "flipkart" and PROXY_WORKER_URL:
-        import urllib.parse
-        encoded_url = urllib.parse.quote(url, safe="")
-        proxy_url = f"{PROXY_WORKER_URL}?url={encoded_url}"
-        try:
-            log.info("   🔄 Trying proxy for Flipkart...")
-            resp = requests.get(proxy_url, timeout=60)
-            if resp.ok and len(resp.text) > 1000:
-                html_text = resp.text
-                log.info("   ✅ Proxy succeeded (%d chars)", len(html_text))
-            else:
-                log.warning("   ⚠️  Proxy returned short/bad response (%d chars)", len(resp.text))
-        except Exception as exc:
-            log.warning("   ⚠️  Proxy failed: %s", exc)
-
-    if html_text is None:
-        log.error("❌ All fetch strategies failed for %s", url)
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        log.error("HTTP request failed for %s: %s", url, exc)
         return None
 
-    log.info("   📄 %d chars | JSON-LD: %s | ₹: %s",
-             len(html_text),
+    html_text = resp.text
+    log.info("   📄 HTTP %d | %d chars | JSON-LD: %s | ₹: %s",
+             resp.status_code, len(html_text),
              "YES" if "application/ld+json" in html_text else "NO",
              "YES" if "₹" in html_text else "NO")
 
