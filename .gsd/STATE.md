@@ -1,5 +1,10 @@
 ## Last Session Summary
-AI News Curator feature implemented (Phase 1).
-- Added `feedparser` and `google-generativeai` to `requirements.txt`.
-- Updated `main.py` with `/news` command logic.
-- Verified syntax: PASSED.
+AI News Curator Feature (v1.1) Complete.
+- `main.py` updated with `feedparser` and `google.generativeai`.
+- `README.md` updated with setup instructions.
+- `.env.example` created.
+- All code committed.
+
+## Next Steps
+- Deploy to Render.
+- Add `GEMINI_API_KEY` environment variable.
