@@ -7,3 +7,4 @@ flask
 gunicorn
 feedparser
 google-generativeai
+trafilatura

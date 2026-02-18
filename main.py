@@ -875,6 +875,195 @@ def handle_news_saved(chat_id: str) -> None:
         handle_news_command(t, chat_id)
 
 
+# ──────────────────────── Wave 3: Multi-Source + Deep Search ───────────────────────
+
+def fetch_multi_source_news(topic: str, max_per_source: int = 3) -> list[dict]:
+    """Fetch news from multiple RSS sources and merge results."""
+    from urllib.parse import quote
+    sources = {
+        "Google": f"https://news.google.com/rss/search?q={quote(topic)}&hl=en-IN&gl=IN&ceid=IN:en",
+        "Reddit": f"https://www.reddit.com/r/{quote(topic)}/hot/.rss?limit=5",
+        "HN": f"https://hnrss.org/newest?q={quote(topic)}&count=5",
+    }
+    all_entries = []
+    for source_name, url in sources.items():
+        try:
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:max_per_source]:
+                all_entries.append({
+                    "title": entry.get("title", "Untitled"),
+                    "link": entry.get("link", ""),
+                    "source": source_name,
+                })
+        except Exception as exc:
+            log.warning("RSS fetch failed for %s: %s", source_name, exc)
+
+    # Deduplicate by rough title similarity (first 30 chars lowercase)
+    seen = set()
+    unique = []
+    for e in all_entries:
+        key = e["title"][:30].lower().strip()
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    return unique[:7]  # top 7 across sources
+
+
+def handle_news_multi(raw_topic: str, chat_id: str) -> None:
+    """Fetch news from multiple sources and summarize."""
+    if not GEMINI_API_KEY:
+        send_telegram_message(
+            "⚠️ News feature is not configured. "
+            "Set the GEMINI_API_KEY environment variable.", chat_id)
+        return
+
+    topic = raw_topic.strip() or "Technology"
+    log.info("📰 Multi-source news: topic='%s'", topic)
+
+    entries = fetch_multi_source_news(topic)
+    if not entries:
+        send_telegram_message(f"📰 No news found for <b>{topic}</b> across sources.", chat_id)
+        return
+
+    headlines = "\n".join(f"- [{e['source']}] {e['title']}" for e in entries)
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    prompt = (
+        f"You are a fun news anchor. Summarize these headlines from multiple sources about "
+        f"'{topic}' in under 150 words. Use emojis. Mention which sources reported what. "
+        f"Ignore duplicates and clickbait.\n\n{headlines}"
+    )
+
+    try:
+        summary = model.generate_content(prompt).text.strip()
+    except Exception as exc:
+        log.error("Gemini API error: %s", exc)
+        summary = f"⚠️ AI summary failed.\n\n{headlines}"
+
+    links = "\n".join(
+        f'  • [{e["source"]}] <a href="{e["link"]}">{e["title"][:45]}{"…" if len(e["title"]) > 45 else ""}</a>'
+        for e in entries
+    )
+
+    send_telegram_message(
+        f"🌐 <b>Multi-Source News: {topic}</b>\n\n"
+        f"{summary}\n\n"
+        f"🔗 <b>Sources</b>\n{links}\n\n"
+        f"— <i>Powered by Gemini ✨</i>", chat_id)
+
+
+def handle_news_trending(chat_id: str) -> None:
+    """Fetch trending topics from Google Trends and summarize."""
+    if not GEMINI_API_KEY:
+        send_telegram_message("⚠️ Set GEMINI_API_KEY first.", chat_id)
+        return
+
+    log.info("📰 Trending topics request")
+    rss_url = "https://trends.google.com/trending/rss?geo=IN"
+
+    try:
+        feed = feedparser.parse(rss_url)
+    except Exception as exc:
+        log.error("Trends RSS error: %s", exc)
+        send_telegram_message("❌ Failed to fetch trending topics.", chat_id)
+        return
+
+    entries = feed.entries[:7]
+    if not entries:
+        send_telegram_message("📰 No trending topics found.", chat_id)
+        return
+
+    topics_list = "\n".join(f"- {e.title}" for e in entries)
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    prompt = (
+        f"You are a fun news anchor. Here are today's trending topics in India. "
+        f"Give a brief, exciting 1-line description for each. Use emojis. "
+        f"Keep total response under 150 words.\n\n{topics_list}"
+    )
+
+    try:
+        summary = model.generate_content(prompt).text.strip()
+    except Exception as exc:
+        log.error("Gemini API error: %s", exc)
+        summary = topics_list
+
+    send_telegram_message(
+        f"🔥 <b>Trending Now (India)</b>\n\n{summary}\n\n"
+        f"— <i>Powered by Gemini ✨</i>", chat_id)
+
+
+def handle_news_deep(raw_topic: str, chat_id: str) -> None:
+    """Deep-read the top article and provide an in-depth summary."""
+    if not GEMINI_API_KEY:
+        send_telegram_message("⚠️ Set GEMINI_API_KEY first.", chat_id)
+        return
+
+    topic = raw_topic.strip() or "Technology"
+    log.info("📰 Deep search: topic='%s'", topic)
+
+    # Fetch top article from Google News
+    from urllib.parse import quote
+    rss_url = f"https://news.google.com/rss/search?q={quote(topic)}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    try:
+        feed = feedparser.parse(rss_url)
+    except Exception as exc:
+        log.error("RSS fetch error: %s", exc)
+        send_telegram_message("❌ Failed to fetch news.", chat_id)
+        return
+
+    if not feed.entries:
+        send_telegram_message(f"📰 No articles found for <b>{topic}</b>.", chat_id)
+        return
+
+    top_entry = feed.entries[0]
+    article_url = top_entry.link
+    article_title = top_entry.title
+
+    send_telegram_message(f"🔍 Reading full article: <b>{article_title[:60]}</b>...", chat_id)
+
+    # Extract full article text
+    try:
+        import trafilatura
+        downloaded = trafilatura.fetch_url(article_url)
+        article_text = trafilatura.extract(downloaded) if downloaded else None
+    except Exception as exc:
+        log.error("Article extraction error: %s", exc)
+        article_text = None
+
+    if not article_text:
+        send_telegram_message("⚠️ Could not read the full article. Falling back to headline summary.", chat_id)
+        handle_news_command(topic, chat_id)
+        return
+
+    # Truncate to 3000 chars for Gemini
+    article_text = article_text[:3000]
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    prompt = (
+        f"You are an expert journalist. Provide a detailed summary of this article about '{topic}'. "
+        f"Cover: key facts, who is involved, why it matters, and what happens next. "
+        f"Use emojis. 200-300 words. Do not start with 'Here is a summary'.\n\n"
+        f"Title: {article_title}\n\nArticle:\n{article_text}"
+    )
+
+    try:
+        summary = model.generate_content(prompt).text.strip()
+    except Exception as exc:
+        log.error("Gemini API error: %s", exc)
+        summary = f"⚠️ AI summary failed.\n\n{article_text[:500]}..."
+
+    send_telegram_message(
+        f"📖 <b>Deep Dive: {article_title[:50]}</b>\n\n"
+        f"{summary}\n\n"
+        f'🔗 <a href="{article_url}">Read full article</a>\n\n'
+        f"— <i>Powered by Gemini ✨</i>", chat_id)
+
+
 # ══════════════════════════ THREE PHASES ══════════════════════════
 
 
@@ -919,6 +1108,12 @@ def phase1_process_commands(
                 handle_news_saved(chat_id)
             elif text_lower.startswith("/news save"):
                 handle_news_save(args[5:].strip(), chat_id)
+            elif text_lower.startswith("/news trending"):
+                handle_news_trending(chat_id)
+            elif text_lower.startswith("/news multi"):
+                handle_news_multi(args[6:].strip(), chat_id)
+            elif text_lower.startswith("/news deep"):
+                handle_news_deep(args[5:].strip(), chat_id)
             else:
                 handle_news_command(args, chat_id)
             continue
@@ -958,6 +1153,7 @@ def phase1_process_commands(
                 "• /status — Quick summary\n"
                 "• /news <topic> — AI news (try: tech, sports, detail)\n"
                 "• /news save <topic> / saved — Save & fetch topics\n"
+                "• /news multi / trending / deep — Advanced modes\n"
                 "• /help — This message\n\n"
                 "Prices are checked every hour automatically. 🕐",
                 chat_id,
@@ -1439,6 +1635,12 @@ def process_single_message(
             handle_news_saved(chat_id)
         elif text_lower.startswith("/news save"):
             handle_news_save(args[5:].strip(), chat_id)
+        elif text_lower.startswith("/news trending"):
+            handle_news_trending(chat_id)
+        elif text_lower.startswith("/news multi"):
+            handle_news_multi(args[6:].strip(), chat_id)
+        elif text_lower.startswith("/news deep"):
+            handle_news_deep(args[5:].strip(), chat_id)
         else:
             handle_news_command(args, chat_id)
         return
@@ -1478,6 +1680,7 @@ def process_single_message(
             "• /status — Quick summary\n"
             "• /news <topic> — AI news (try: tech, sports, detail)\n"
             "• /news save <topic> / saved — Save & fetch topics\n"
+            "• /news multi / trending / deep — Advanced modes\n"
             "• /help — This message\n\n"
             "Prices are checked every hour automatically. 🕐",
             chat_id,
