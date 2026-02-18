@@ -1064,6 +1064,257 @@ def handle_news_deep(raw_topic: str, chat_id: str) -> None:
         f"— <i>Powered by Gemini ✨</i>", chat_id)
 
 
+
+# ──────────────────────── Wave 4: Rich Media + Scheduling ───────────────────────
+
+def send_telegram_voice(audio_path: str, chat_id: str, caption: str = "") -> bool:
+    """Send a voice message via Telegram Bot API."""
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendVoice"
+    try:
+        with open(audio_path, "rb") as audio_file:
+            resp = requests.post(
+                api_url,
+                data={"chat_id": chat_id or CHAT_ID, "caption": caption},
+                files={"voice": audio_file},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            log.info("✅ Voice message sent.")
+            return True
+    except Exception as exc:
+        log.error("Failed to send voice: %s", exc)
+        return False
+
+
+def send_telegram_photo(image_path: str, chat_id: str, caption: str = "") -> bool:
+    """Send a photo via Telegram Bot API."""
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    try:
+        with open(image_path, "rb") as img_file:
+            resp = requests.post(
+                api_url,
+                data={
+                    "chat_id": chat_id or CHAT_ID,
+                    "caption": caption,
+                    "parse_mode": "HTML",
+                },
+                files={"photo": img_file},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            log.info("✅ Photo sent.")
+            return True
+    except Exception as exc:
+        log.error("Failed to send photo: %s", exc)
+        return False
+
+
+def handle_news_voice(raw_topic: str, chat_id: str) -> None:
+    """Generate a voice summary of the news using gTTS."""
+    if not GEMINI_API_KEY:
+        send_telegram_message("⚠️ Set GEMINI_API_KEY first.", chat_id)
+        return
+
+    topic = raw_topic.strip() or "Technology"
+    log.info("🎙️ Voice news: topic='%s'", topic)
+
+    # Get headlines
+    from urllib.parse import quote
+    rss_url = f"https://news.google.com/rss/search?q={quote(topic)}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    try:
+        feed = feedparser.parse(rss_url)
+    except Exception as exc:
+        log.error("RSS error: %s", exc)
+        send_telegram_message("❌ Failed to fetch news.", chat_id)
+        return
+
+    entries = feed.entries[:5]
+    if not entries:
+        send_telegram_message(f"📰 No news found for <b>{topic}</b>.", chat_id)
+        return
+
+    headlines = "\n".join(f"- {e.title}" for e in entries)
+
+    # Summarize for speech
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.0-flash")
+    prompt = (
+        f"You are a radio news anchor. Read these headlines about '{topic}' in a natural, "
+        f"conversational way. Under 100 words. No emojis. No markdown. Plain text only.\n\n{headlines}"
+    )
+
+    try:
+        summary = model.generate_content(prompt).text.strip()
+    except Exception as exc:
+        log.error("Gemini error: %s", exc)
+        summary = ". ".join(e.title for e in entries)
+
+    send_telegram_message(f"🎙️ Generating voice summary for <b>{topic}</b>...", chat_id)
+
+    # Generate audio
+    import tempfile
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=summary, lang="en", slow=False)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tts.save(tmp.name)
+            send_telegram_voice(tmp.name, chat_id, caption=f"📰 News: {topic}")
+        import os as _os
+        _os.unlink(tmp.name)
+    except Exception as exc:
+        log.error("TTS error: %s", exc)
+        send_telegram_message(f"⚠️ Voice generation failed. Here's the text:\n\n{summary}", chat_id)
+
+
+def generate_news_card_image(topic: str, headlines: list[str], output_path: str) -> None:
+    """Generate a styled news card image using Pillow."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    W, H = 800, 500
+    img = Image.new("RGB", (W, H))
+    draw = ImageDraw.Draw(img)
+
+    # Dark gradient background
+    for y in range(H):
+        r = int(15 + (25 * y / H))
+        g = int(15 + (10 * y / H))
+        b = int(40 + (30 * y / H))
+        draw.line([(0, y), (W, y)], fill=(r, g, b))
+
+    # Use default font (no external fonts needed)
+    try:
+        title_font = ImageFont.truetype("arial.ttf", 32)
+        body_font = ImageFont.truetype("arial.ttf", 18)
+        small_font = ImageFont.truetype("arial.ttf", 14)
+    except (IOError, OSError):
+        title_font = ImageFont.load_default()
+        body_font = ImageFont.load_default()
+        small_font = ImageFont.load_default()
+
+    # Accent bar
+    draw.rectangle([(0, 0), (W, 6)], fill=(99, 102, 241))
+
+    # Topic title
+    draw.text((30, 30), f"📰 {topic}", fill=(255, 255, 255), font=title_font)
+
+    # Separator line
+    draw.line([(30, 80), (W - 30, 80)], fill=(99, 102, 241), width=2)
+
+    # Headlines
+    y_pos = 100
+    for i, headline in enumerate(headlines[:5]):
+        # Truncate long headlines
+        if len(headline) > 70:
+            headline = headline[:67] + "..."
+        bullet = f"  {i+1}. {headline}"
+        draw.text((30, y_pos), bullet, fill=(220, 220, 230), font=body_font)
+        y_pos += 40
+
+    # Footer
+    draw.text((30, H - 40), "Powered by Gemini ✨ • Price Drop Hunter", fill=(120, 120, 150), font=small_font)
+
+    img.save(output_path, "PNG")
+
+
+def handle_news_card(raw_topic: str, chat_id: str) -> None:
+    """Generate a visual news card and send as image."""
+    topic = raw_topic.strip() or "Technology"
+    log.info("🖼️ News card: topic='%s'", topic)
+
+    from urllib.parse import quote
+    rss_url = f"https://news.google.com/rss/search?q={quote(topic)}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    try:
+        feed = feedparser.parse(rss_url)
+    except Exception as exc:
+        log.error("RSS error: %s", exc)
+        send_telegram_message("❌ Failed to fetch news.", chat_id)
+        return
+
+    entries = feed.entries[:5]
+    if not entries:
+        send_telegram_message(f"📰 No news found for <b>{topic}</b>.", chat_id)
+        return
+
+    headlines = [e.title for e in entries]
+
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            generate_news_card_image(topic, headlines, tmp.name)
+            send_telegram_photo(tmp.name, chat_id, caption=f"📰 News: {topic}")
+        import os as _os
+        _os.unlink(tmp.name)
+    except Exception as exc:
+        log.error("News card error: %s", exc)
+        send_telegram_message("⚠️ Failed to generate news card.", chat_id)
+
+
+def handle_news_schedule(args: str, chat_id: str) -> None:
+    """Toggle scheduled daily news digest on/off."""
+    action = args.strip().lower()
+
+    if action not in ("on", "off", ""):
+        send_telegram_message(
+            "⚠️ Usage:\n"
+            "<code>/news schedule on</code> — Enable daily digest\n"
+            "<code>/news schedule off</code> — Disable daily digest", chat_id)
+        return
+
+    try:
+        sheet = connect_to_sheet()
+        settings_ws = get_settings_worksheet(sheet)
+
+        if action == "on":
+            settings_ws.update_acell("B1", "digest_on")
+            send_telegram_message(
+                "✅ Daily news digest <b>enabled</b>!\n\n"
+                "You'll get a summary of your saved topics every morning at 8 AM IST.\n"
+                "Make sure you have topics saved with <code>/news save</code>.", chat_id)
+        elif action == "off":
+            settings_ws.update_acell("B1", "digest_off")
+            send_telegram_message("⏸️ Daily news digest <b>disabled</b>.", chat_id)
+        else:
+            # Show current status
+            val = settings_ws.acell("B1").value
+            status = "enabled ✅" if val == "digest_on" else "disabled ⏸️"
+            send_telegram_message(f"📰 Daily digest is currently <b>{status}</b>.", chat_id)
+
+    except Exception as exc:
+        log.error("Schedule toggle error: %s", exc)
+        send_telegram_message("❌ Failed to update schedule.", chat_id)
+
+
+def run_scheduled_digest() -> None:
+    """Run the scheduled news digest — called by APScheduler or cron."""
+    try:
+        sheet = connect_to_sheet()
+        settings_ws = get_settings_worksheet(sheet)
+        val = settings_ws.acell("B1").value
+        if val != "digest_on":
+            log.info("📰 Digest not enabled, skipping.")
+            return
+
+        topics_ws = get_news_topics_worksheet(sheet)
+        topics = topics_ws.col_values(1)[1:]
+        if not topics:
+            log.info("📰 No saved topics for digest.")
+            return
+
+        send_telegram_message(
+            f"🌅 <b>Good Morning! Your Daily News Digest</b>\n\n"
+            f"Fetching {len(topics)} topics...", CHAT_ID)
+
+        for t in topics:
+            handle_news_command(t, CHAT_ID)
+
+        send_telegram_message("☕ That's your digest! Have a great day.", CHAT_ID)
+
+    except Exception as exc:
+        log.error("Scheduled digest error: %s", exc)
+
+
 # ══════════════════════════ THREE PHASES ══════════════════════════
 
 
@@ -1114,6 +1365,12 @@ def phase1_process_commands(
                 handle_news_multi(args[6:].strip(), chat_id)
             elif text_lower.startswith("/news deep"):
                 handle_news_deep(args[5:].strip(), chat_id)
+            elif text_lower.startswith("/news voice"):
+                handle_news_voice(args[6:].strip(), chat_id)
+            elif text_lower.startswith("/news card"):
+                handle_news_card(args[5:].strip(), chat_id)
+            elif text_lower.startswith("/news schedule"):
+                handle_news_schedule(args[9:].strip(), chat_id)
             else:
                 handle_news_command(args, chat_id)
             continue
@@ -1154,6 +1411,7 @@ def phase1_process_commands(
                 "• /news <topic> — AI news (try: tech, sports, detail)\n"
                 "• /news save <topic> / saved — Save & fetch topics\n"
                 "• /news multi / trending / deep — Advanced modes\n"
+                "• /news voice / card / schedule — Media & digest\n"
                 "• /help — This message\n\n"
                 "Prices are checked every hour automatically. 🕐",
                 chat_id,
@@ -1641,6 +1899,12 @@ def process_single_message(
             handle_news_multi(args[6:].strip(), chat_id)
         elif text_lower.startswith("/news deep"):
             handle_news_deep(args[5:].strip(), chat_id)
+        elif text_lower.startswith("/news voice"):
+            handle_news_voice(args[6:].strip(), chat_id)
+        elif text_lower.startswith("/news card"):
+            handle_news_card(args[5:].strip(), chat_id)
+        elif text_lower.startswith("/news schedule"):
+            handle_news_schedule(args[9:].strip(), chat_id)
         else:
             handle_news_command(args, chat_id)
         return
@@ -1681,6 +1945,7 @@ def process_single_message(
             "• /news <topic> — AI news (try: tech, sports, detail)\n"
             "• /news save <topic> / saved — Save & fetch topics\n"
             "• /news multi / trending / deep — Advanced modes\n"
+            "• /news voice / card / schedule — Media & digest\n"
             "• /help — This message\n\n"
             "Prices are checked every hour automatically. 🕐",
             chat_id,
