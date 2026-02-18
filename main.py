@@ -638,7 +638,71 @@ def handle_add_product(
 
 # ──────────────────────── News Logic ───────────────────────
 
-def handle_news_command(topic: str, chat_id: str) -> None:
+# Category presets — shortcuts for common topics
+CATEGORY_PRESETS = {
+    "tech": "Technology",
+    "sports": "Sports India",
+    "business": "Business Finance India",
+    "world": "World News",
+    "entertainment": "Bollywood Entertainment",
+    "science": "Science Discoveries",
+    "health": "Health Wellness",
+    "gaming": "Video Games Gaming",
+    "crypto": "Cryptocurrency Bitcoin",
+    "ai": "Artificial Intelligence AI",
+}
+
+# Supported languages for summaries
+LANGUAGES = {
+    "hindi", "tamil", "telugu", "bengali", "marathi", "gujarati",
+    "kannada", "malayalam", "punjabi", "urdu", "spanish", "french",
+    "german", "japanese", "korean", "chinese", "arabic",
+}
+
+
+def parse_news_args(raw_topic: str) -> tuple[str, str, bool]:
+    """
+    Parse the /news arguments into (topic, language, is_detail).
+
+    Supports:
+      /news                       → ("Technology", "English", False)
+      /news Cricket               → ("Cricket", "English", False)
+      /news Cricket hindi         → ("Cricket", "Hindi", False)
+      /news detail Cricket        → ("Cricket", "English", True)
+      /news detail Cricket hindi  → ("Cricket", "Hindi", True)
+      /news tech                  → ("Technology", "English", False)
+    """
+    parts = raw_topic.strip().split()
+    is_detail = False
+    language = "English"
+
+    if not parts:
+        return "Technology", language, is_detail
+
+    # Check for 'detail' flag
+    if parts[0].lower() == "detail":
+        is_detail = True
+        parts = parts[1:]
+
+    if not parts:
+        return "Technology", language, is_detail
+
+    # Check if last word is a language
+    if len(parts) > 1 and parts[-1].lower() in LANGUAGES:
+        language = parts[-1].capitalize()
+        parts = parts[:-1]
+
+    # Join remaining as topic
+    topic = " ".join(parts)
+
+    # Check for category preset
+    if topic.lower() in CATEGORY_PRESETS:
+        topic = CATEGORY_PRESETS[topic.lower()]
+
+    return topic or "Technology", language, is_detail
+
+
+def handle_news_command(raw_topic: str, chat_id: str) -> None:
     """Fetch Google News RSS for a topic and summarize with Gemini."""
     if not GEMINI_API_KEY:
         send_telegram_message(
@@ -646,14 +710,17 @@ def handle_news_command(topic: str, chat_id: str) -> None:
             "Set the GEMINI_API_KEY environment variable.", chat_id)
         return
 
-    # Default to 'Technology' if no topic provided
-    final_topic = topic.strip() or "Technology"
+    # Parse arguments
+    topic, language, is_detail = parse_news_args(raw_topic)
+    word_limit = 300 if is_detail else 100
+    mode_label = "📖 Detail" if is_detail else "⚡ Quick"
+
+    log.info("📰 News request: topic='%s', lang='%s', detail=%s", topic, language, is_detail)
 
     # 1. Fetch RSS
-    # Using specific Google News RSS URL format
     from urllib.parse import quote
-    rss_url = f"https://news.google.com/rss/search?q={quote(final_topic)}&hl=en-IN&gl=IN&ceid=IN:en"
-    
+    rss_url = f"https://news.google.com/rss/search?q={quote(topic)}&hl=en-IN&gl=IN&ceid=IN:en"
+
     try:
         feed = feedparser.parse(rss_url)
     except Exception as exc:
@@ -661,9 +728,9 @@ def handle_news_command(topic: str, chat_id: str) -> None:
         send_telegram_message("❌ Failed to fetch news.", chat_id)
         return
 
-    entries = feed.entries[:3]
+    entries = feed.entries[:5]
     if not entries:
-        send_telegram_message(f"📰 No news found for <b>{final_topic}</b>.", chat_id)
+        send_telegram_message(f"📰 No news found for <b>{topic}</b>.", chat_id)
         return
 
     headlines = "\n".join(f"- {e.title}" for e in entries)
@@ -671,24 +738,40 @@ def handle_news_command(topic: str, chat_id: str) -> None:
     # 2. Summarize with Gemini
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel("gemini-2.0-flash")
+
+    lang_instruction = (
+        f" Respond entirely in {language}." if language != "English" else ""
+    )
+
     prompt = (
         f"You are a fun news anchor. Summarize these headlines about "
-        f"'{final_topic}' in under 100 words. Use emojis. Keep it casual and "
-        f"informative. Do not include introductory phrases like 'Here is the summary'.\n\n{headlines}"
+        f"'{topic}' in under {word_limit} words. Use emojis. Keep it casual and "
+        f"informative. Do not include introductory phrases like 'Here is the summary'."
+        f" Ignore duplicate or clickbait headlines — only summarize genuinely distinct stories."
+        f"{lang_instruction}\n\n{headlines}"
     )
-    
+
     try:
         response = model.generate_content(prompt)
         summary = response.text.strip()
     except Exception as exc:
         log.error("Gemini API error: %s", exc)
-        # Fallback: just show headlines
         summary = f"⚠️ AI summary failed. Here are the headlines:\n\n{headlines}"
 
-    # 3. Send
+    # 3. Build source links
+    links = "\n".join(
+        f'  • <a href="{e.link}">{e.title[:50]}{"…" if len(e.title) > 50 else ""}</a>'
+        for e in entries
+    )
+
+    # 4. Send
+    lang_tag = f" ({language})" if language != "English" else ""
     send_telegram_message(
-        f"📰 <b>News: {final_topic}</b>\n\n{summary}\n\n"
+        f"📰 <b>News: {topic}</b>{lang_tag}  [{mode_label}]\n\n"
+        f"{summary}\n\n"
+        f"🔗 <b>Sources</b>\n{links}\n\n"
         f"— <i>Powered by Gemini ✨</i>", chat_id)
+
 
 
 # ══════════════════════════ THREE PHASES ══════════════════════════
@@ -767,7 +850,7 @@ def phase1_process_commands(
                 "<b>Info:</b>\n"
                 "• /history 1 — Price history for #1\n"
                 "• /status — Quick summary\n"
-                "• /news <topic> — AI news summary\n"
+                "• /news <topic> — AI news (try: tech, sports, detail)\n"
                 "• /help — This message\n\n"
                 "Prices are checked every hour automatically. 🕐",
                 chat_id,
@@ -1281,7 +1364,7 @@ def process_single_message(
             "<b>Info:</b>\n"
             "• /history 1 — Price history for #1\n"
             "• /status — Quick summary\n"
-            "• /news <topic> — AI news summary\n"
+            "• /news <topic> — AI news (try: tech, sports, detail)\n"
             "• /help — This message\n\n"
             "Prices are checked every hour automatically. 🕐",
             chat_id,
