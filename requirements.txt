@@ -7,3 +7,6 @@ flask
 gunicorn
 feedparser
 google-generativeai
+trafilatura
+gTTS
+Pillow
